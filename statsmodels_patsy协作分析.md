@@ -1,8 +1,14 @@
-# Statsmodels 与 Patsy 协作关系分析报告
+# Statsmodels 与 Patsy 协作关系分析报告（修订版）
 
 ## 概述
 
-在 statsmodels 中使用公式字符串（如 `"y ~ x1 + x2 + C(category)"`）进行统计建模时，patsy 库承担了从公式解析到设计矩阵生成的核心工作，而 statsmodels 则负责统计估计和结果分析。本文档详细分析两个库的职责划分、协作流程以及契约边界。
+在 statsmodels 中使用公式字符串（如 `"y ~ x1 + x2 + C(category)"`）进行统计建模时，patsy 库承担了从公式解析到设计矩阵生成的核心工作，而 statsmodels 则负责统计估计和结果分析。
+
+**本文档的关键修正**：
+- 之前的报告错误地将线性回归的 `fit()` 描述为通用迭代优化流程
+- 实际上，**OLS/WLS/GLS 使用解析解**（直接矩阵运算，0 次迭代）
+- **Logit/Probit/Poisson 等似然模型使用迭代优化**
+- **GLM 默认使用 IRLS（迭代重加权最小二乘）**
 
 ---
 
@@ -69,24 +75,6 @@ else:  # "~" in formula:
 - `Poly`：多项式编码
 - `Helmert`：Helmert 编码
 
-**关键代码引用**：
-```python
-# statsmodels/formula/_manager.py:937-969
-def get_contrast_matrix(self, term, factor, model_spec):
-    if self._using_patsy:
-        return model_spec.term_codings[term][0].contrast_matrices[factor].matrix
-    else:
-        # formulaic 的处理逻辑
-        cat = self.get_factor_categories(factor, model_spec)
-        reduced_rank = True
-        # ...
-        return np.asarray(
-            model_spec.factor_contrasts[factor].get_coding_matrix(
-                reduced_rank=reduced_rank
-            )
-        )
-```
-
 ### 1.4 缺失值处理
 
 **核心功能**：在构建设计矩阵时处理缺失值。
@@ -95,7 +83,6 @@ def get_contrast_matrix(self, term, factor, model_spec):
 ```python
 # statsmodels/formula/_manager.py:30-38
 class NAAction(patsy.missing.NAAction):
-    # monkey-patch so we can handle missing values in 'extra' arrays later
     def _handle_NA_drop(self, values, is_nas, origins):
         total_mask = np.zeros(is_nas[0].shape[0], dtype=bool)
         for is_NA in is_nas:
@@ -108,24 +95,10 @@ class NAAction(patsy.missing.NAAction):
 **处理策略**：
 - `drop`：删除包含缺失值的行（默认）
 - `raise`：遇到缺失值时抛出异常
-- `NA_types`：定义哪些值被视为缺失（默认 `None`, `NaN`）
 
 ### 1.5 评估环境管理
 
 **核心功能**：处理公式中引用的外部变量和函数。
-
-**关键代码引用**：
-```python
-# statsmodels/formula/_manager.py:466-472
-if isinstance(eval_env, Mapping):
-    _eval_env = patsy.eval.EvalEnvironment(
-        [{key: val} for key, val in eval_env.items()]
-    )
-else:
-    _eval_env = eval_env
-    if isinstance(eval_env, patsy.eval.EvalEnvironment):
-        warnings.warn(EVAL_ENV_WARNING, FutureWarning, stacklevel=2)
-```
 
 **工作原理**：
 - `eval_env=0`：使用调用者的命名空间
@@ -146,8 +119,8 @@ else:
 ```
 
 **DesignInfo 包含的信息**：
-- `column_names`：设计矩阵的列名
-- `term_names`：公式中的项名
+- `column_names`：设计矩阵的列名（包括编码后的虚拟变量）
+- `term_names`：公式中的原始项名
 - `term_name_slices`：每个项对应的列切片
 - `factor_infos`：每个因子的信息（类型、类别等）
 - `term_codings`：每个项的编码信息
@@ -155,11 +128,35 @@ else:
 
 ---
 
-## 二、Statsmodels 的职责
+## 二、Statsmodels 的职责：关键修正
 
-Statsmodels 作为统计建模框架，承担以下职责：
+### 2.1 模型继承体系概览
 
-### 2.1 公式引擎抽象层
+**重要理解**：不同模型类型的 `fit()` 方法实现**完全不同**。
+
+```
+base.Model（最基类，定义 from_formula）
+│
+└── base.LikelihoodModel（定义迭代优化 fit()）
+    │
+    ├── RegressionModel（重写 fit()，使用解析解）
+    │   ├── GLS
+    │   │   └── WLS
+    │   │       └── OLS  ← 解析解，0 次迭代！
+    │   └── GLSAR
+    │
+    ├── DiscreteModel（不重写 fit()，调用父类迭代优化）
+    │   ├── BinaryModel
+    │   │   ├── Logit   ← 迭代优化
+    │   │   └── Probit  ← 迭代优化
+    │   └── CountModel
+    │       ├── Poisson  ← 迭代优化
+    │       └── NegativeBinomial
+    │
+    └── GLM（自定义 fit()，默认 IRLS，可选梯度优化）
+```
+
+### 2.2 公式引擎抽象层
 
 **核心功能**：通过 `FormulaManager` 类统一 patsy 和 formulaic 两个公式引擎的接口。
 
@@ -177,54 +174,6 @@ class FormulaManager:
         self._using_patsy = self._engine == "patsy"
         self._spec = None
         self._missing_mask = None
-```
-
-**引擎选择逻辑**：
-```python
-# statsmodels/formula/_manager.py:17-27
-DEFAULT_FORMULA_ENGINE = os.environ.get("SM_FORMULA_ENGINE", None)
-if DEFAULT_FORMULA_ENGINE not in ("formulaic", "patsy", None):
-    raise ValueError(f"Invalid value for SM_FORMULA_ENGINE: {DEFAULT_FORMULA_ENGINE}")
-
-ensure_patsy_compat()
-
-try:
-    import patsy
-    import patsy.missing
-    DEFAULT_FORMULA_ENGINE = DEFAULT_FORMULA_ENGINE or "patsy"
-    # ...
-    HAVE_PATSY = True
-except ImportError:
-    DEFAULT_FORMULA_ENGINE = DEFAULT_FORMULA_ENGINE or "formulaic"
-```
-
-### 2.2 数据与公式的桥梁
-
-**核心功能**：`handle_formula_data` 函数连接公式和数据。
-
-**关键代码引用**：
-```python
-# statsmodels/formula/formulatools.py:15-76
-def handle_formula_data(Y, X, formula, depth=0, missing="drop"):
-    """
-    Returns endog, exog, and the model specification from arrays and formula.
-    """
-    na_action = FormulaManager().get_na_action(action=missing)
-    mgr = FormulaManager()
-    if X is not None:
-        result = mgr.get_matrices(
-            formula, (Y, X), eval_env=depth, pandas=True, na_action=na_action
-        )
-    else:
-        # ...
-        result = mgr.get_matrices(
-            formula, Y, eval_env=depth, pandas=True, na_action=na_action
-        )
-    
-    missing_mask = mgr.missing_mask
-    # ...
-    model_spec = mgr.spec
-    return result, missing_mask, model_spec
 ```
 
 ### 2.3 模型实例化入口
@@ -255,76 +204,494 @@ def from_formula(cls, formula, data, subset=None, drop_cols=None, *args, **kwarg
     if missing == "none":  # with patsy it's drop or raise. let's raise.
         missing = "raise"
     
+    # 调用公式处理函数 → 进入 Patsy
     tmp = handle_formula_data(data, None, formula, depth=eval_env, missing=missing)
     ((endog, exog), missing_idx, model_spec) = tmp
     
     # ... 验证和处理 drop_cols
     
+    # 附加元数据
     kwargs.update({
         "missing_idx": missing_idx,
         "missing": missing,
-        "formula": formula,  # attach formula for unpckling
+        "formula": formula,
         "model_spec": model_spec,
     })
     
+    # 实例化模型
+    # 注意：此时 endog 和 exog 已经是纯数值矩阵！
     mod = cls(endog, exog, *args, **kwargs)
     mod.formula = formula
     mod.data.frame = data
     return mod
 ```
 
-### 2.4 统计估计与推断
+**关键理解**：
+- `from_formula` 的作用是：**公式字符串 → 数值矩阵**
+- 一旦模型实例化完成，`self.exog` 和 `self.endog` 就是纯数值类型
+- 后续的 `fit()` 方法**不再需要公式信息**，只使用数值矩阵
 
-**核心功能**：使用 patsy 生成的设计矩阵进行统计建模。
+### 2.4 参数估计：三种求解机制的详细对比
 
-**关键代码引用（OLS 拟合流程）**：
-```python
-# 模型初始化 - statsmodels/base/model.py:100-116
-def __init__(self, endog, exog=None, **kwargs):
-    missing = kwargs.pop("missing", "none")
-    hasconst = kwargs.pop("hasconst", None)
-    self.data = self._handle_data(endog, exog, missing, hasconst, **kwargs)
-    self.k_constant = self.data.k_constant
-    self.exog = self.data.exog
-    self.endog = self.data.endog
-    # ...
+#### 2.4.1 线性回归：OLS/WLS/GLS（解析解）
+
+**数学原理**：
+
+对于线性模型 `y = Xβ + ε`，最小二乘估计有**闭式解**：
+
+```
+β̂ = (X'X)⁻¹X'y
 ```
 
-**似然模型拟合**：
+或通过 QR 分解求解：
+
+```
+X = QR
+β̂ = R⁻¹Q'y
+```
+
+**关键代码引用**（`RegressionModel.fit()`）：
+
+```python
+# statsmodels/regression/linear_model.py:284-415
+def fit(
+    self,
+    method: Literal["pinv", "qr"] = "pinv",  # 注意：没有 "newton", "bfgs"！
+    cov_type: Literal["nonrobust", "HC0", "HC1", ...] = "nonrobust",
+    **kwargs,
+):
+    """
+    Full fit of the model.
+    
+    The fit method uses the pseudoinverse of the design/exogenous variables
+    to solve the least squares minimization.
+    """
+    
+    # ========== 方法 1：Moore-Penrose 伪逆（默认） ==========
+    if method == "pinv":
+        if not (
+            hasattr(self, "pinv_wexog")
+            and hasattr(self, "normalized_cov_params")
+            and hasattr(self, "rank")
+        ):
+            # 计算伪逆: pinv(X) = X'(X'X)^{-1}
+            self.pinv_wexog, singular_values = pinv_extended(self.wexog)
+            
+            # 规范化协方差矩阵: (X'X)^{-1}
+            self.normalized_cov_params = np.dot(
+                self.pinv_wexog, np.transpose(self.pinv_wexog)
+            )
+            
+            self.rank = np.linalg.matrix_rank(np.diag(singular_values))
+        
+        # ⚠️ 关键：直接计算，无迭代！
+        # β̂ = pinv(X) * y
+        beta = np.dot(self.pinv_wexog, self.wendog)
+    
+    # ========== 方法 2：QR 分解 ==========
+    elif method == "qr":
+        if not (
+            hasattr(self, "exog_Q")
+            and hasattr(self, "exog_R")
+            and hasattr(self, "normalized_cov_params")
+            and hasattr(self, "rank")
+        ):
+            # QR 分解: X = QR
+            Q, R = np.linalg.qr(self.wexog)
+            self.exog_Q, self.exog_R = Q, R
+            
+            # 规范化协方差矩阵: R^{-1}(R')^{-1}
+            self.normalized_cov_params = np.linalg.inv(np.dot(R.T, R))
+            
+            self.rank = np.linalg.matrix_rank(R)
+        
+        # 计算效应: Q'y
+        self.effects = np.dot(Q.T, self.wendog)
+        
+        # ⚠️ 关键：解三角方程组，无迭代！
+        # β̂ = R^{-1}Q'y
+        beta = np.linalg.solve(R, self.effects)
+    
+    else:
+        raise ValueError('method has to be "pinv" or "qr"')
+    
+    # ========== 自由度计算 ==========
+    if self._df_model is None:
+        self._df_model = float(self.rank - self.k_constant)
+    if self._df_resid is None:
+        self.df_resid = self.nobs - self.rank
+    
+    # ========== 返回结果 ==========
+    if isinstance(self, OLS):
+        lfit = OLSResults(
+            self,
+            beta,
+            normalized_cov_params=self.normalized_cov_params,
+            cov_type=cov_type,
+            cov_kwds=cov_kwds,
+            use_t=use_t,
+        )
+    else:
+        lfit = RegressionResults(
+            self,
+            beta,
+            normalized_cov_params=self.normalized_cov_params,
+            cov_type=cov_type,
+            cov_kwds=cov_kwds,
+            use_t=use_t,
+            **kwargs,
+        )
+    return RegressionResultsWrapper(lfit)
+```
+
+**与之前错误描述的关键差异**：
+
+| 项目 | 错误描述（之前） | 正确实现（实际代码） |
+|------|-----------------|---------------------|
+| 求解方式 | 迭代优化（Newton、BFGS 等） | 解析解（pinv 或 QR） |
+| 方法参数 | `method="newton"`, `method="bfgs"` | `method="pinv"`, `method="qr"` |
+| 起始参数 | 需要 `start_params` | 不需要 |
+| 迭代次数 | 多次 | **0 次** |
+| 收敛检查 | 需要 | 不需要 |
+| Hessian | 需要计算 | 不需要 |
+
+#### 2.4.2 似然模型：Logit/Probit/Poisson（迭代优化）
+
+**数学原理**：
+
+对于离散选择模型，没有解析解，需要通过**极大似然估计**进行迭代求解：
+
+```
+β̂ = argmax_β log L(β|y,X)
+```
+
+使用梯度下降或 Newton-Raphson 等方法迭代求解。
+
+**继承关系分析**：
+- `DiscreteModel` 继承自 `LikelihoodModel`
+- `DiscreteModel.fit()` **没有完全重写**，而是调用 `super().fit()`
+- `super().fit()` 即 `LikelihoodModel.fit()`，使用迭代优化
+
+**关键代码引用**（`DiscreteModel.fit()`）：
+
+```python
+# statsmodels/discrete/discrete_model.py:242-274
+@Appender(base.LikelihoodModel.fit.__doc__)
+def fit(
+    self,
+    start_params=None,
+    method="newton",  # 注意：这里是 "newton"，不是 "pinv"！
+    maxiter=35,       # 注意：有迭代次数限制！
+    full_output=1,
+    disp=1,
+    callback=None,
+    **kwargs,
+):
+    """
+    Fit the model using maximum likelihood.
+    
+    The rest of the docstring is from
+    statsmodels.base.model.LikelihoodModel.fit
+    """
+    # 添加完美预测检测的回调
+    if callback is None:
+        callback = self._check_perfect_pred
+    
+    # ⚠️ 关键：调用父类 LikelihoodModel.fit() - 迭代优化！
+    mlefit = super().fit(
+        start_params=start_params,
+        method=method,
+        maxiter=maxiter,
+        full_output=full_output,
+        disp=disp,
+        callback=callback,
+        **kwargs,
+    )
+    
+    return mlefit
+```
+
+**关键代码引用**（`LikelihoodModel.fit()`，真正的迭代优化）：
+
 ```python
 # statsmodels/base/model.py:362-651
-def fit(self, start_params=None, method="newton", maxiter=100, ...):
-    # 1. 准备起始参数
+def fit(
+    self,
+    start_params=None,
+    method="newton",      # 支持 "newton", "nm", "bfgs", "lbfgs", "cg", "ncg", "powell"
+    maxiter=100,           # 迭代次数限制
+    full_output=True,
+    disp=True,
+    fargs=(),
+    callback=None,
+    retall=False,
+    skip_hessian=False,
+    **kwargs,
+):
+    """
+    Fit method for likelihood based models
+    
+    支持的优化方法:
+    - 'newton': Newton-Raphson（需要 score 和 hessian）
+    - 'nm': Nelder-Mead（单纯形法，只需要函数值）
+    - 'bfgs': Broyden-Fletcher-Goldfarb-Shanno（需要梯度）
+    - 'lbfgs': Limited-memory BFGS
+    - 'cg': Conjugate Gradient
+    - 'ncg': Newton-Conjugate Gradient
+    - 'powell': Modified Powell's
+    """
+    
+    # ========== 步骤 1：准备起始参数 ==========
+    # ⚠️ 注意：迭代方法需要起始参数！
     if start_params is None:
         if hasattr(self, "start_params"):
             start_params = self.start_params
         elif self.exog is not None:
-            start_params = [0.0] * self.exog.shape[1]
+            start_params = [0.0] * self.exog.shape[1]  # 默认全 0
+        else:
+            raise ValueError(
+                "If exog is None, then start_params should be specified"
+            )
     
-    # 2. 定义目标函数（负对数似然）
+    # ========== 步骤 2：定义目标函数 ==========
+    nobs = self.endog.shape[0]
+    
+    # 负对数似然（除以 nobs 用于数值稳定性）
     def f(params, *args):
         return -self.loglike(params, *args) / nobs
     
-    # 3. 选择优化方法
+    # ========== 步骤 3：定义梯度和 Hessian ==========
+    if method == "newton":
+        # Newton-Raphson: 使用 score（梯度）和 hessian（海森）
+        def score(params, *args):
+            return self.score(params, *args) / nobs
+        
+        def hess(params, *args):
+            return self.hessian(params, *args) / nobs
+    else:
+        # 其他方法：梯度取负
+        def score(params, *args):
+            return -self.score(params, *args) / nobs
+        
+        def hess(params, *args):
+            return -self.hessian(params, *args) / nobs
+    
+    # ========== 步骤 4：调用优化器（迭代！） ==========
     optimizer = Optimizer()
     xopt, retvals, optim_settings = optimizer._fit(
-        f, score, start_params, fargs, kwargs,
-        hessian=hess, method=method, ...
+        f,
+        score,
+        start_params,
+        fargs,
+        kwargs,
+        hessian=hess,
+        method=method,
+        disp=disp,
+        maxiter=maxiter,
+        callback=callback,
+        retall=retall,
+        full_output=full_output,
     )
     
-    # 4. 计算协方差矩阵
+    # ========== 步骤 5：收敛检查 ==========
+    # ⚠️ 注意：迭代方法需要检查是否收敛！
+    if isinstance(retvals, dict):
+        if warn_convergence and not retvals["converged"]:
+            from statsmodels.tools.sm_exceptions import ConvergenceWarning
+            warnings.warn(
+                "Maximum Likelihood optimization failed to "
+                "converge. Check mle_retvals",
+                ConvergenceWarning,
+                stacklevel=2,
+            )
+    
+    # ========== 步骤 6：计算协方差矩阵 ==========
     if not skip_hessian:
         H = -1 * self.hessian(xopt)
-        # 检查正定性并求逆
-        # ...
-        Hinv = eigvecs.dot(np.diag(1.0 / eigvals)).dot(eigvecs.T)
+        invertible = False
+        if np.all(np.isfinite(H)):
+            eigvals, eigvecs = np.linalg.eigh(H)
+            if np.min(eigvals) > 0:
+                invertible = True
+        
+        if invertible:
+            # Cov = -H^{-1}
+            Hinv = eigvecs.dot(np.diag(1.0 / eigvals)).dot(eigvecs.T)
+        else:
+            warnings.warn(
+                "Inverting hessian failed, no bse or cov_params available",
+                HessianInversionWarning,
+                stacklevel=2,
+            )
+            Hinv = None
     
-    # 5. 包装结果
+    # ========== 步骤 7：包装结果 ==========
     mlefit = LikelihoodModelResults(self, xopt, Hinv, scale=1.0, **kwds)
+    mlefit.mle_retvals = retvals
+    mlefit.mle_settings = optim_settings
     return mlefit
 ```
 
-### 2.5 预测时的公式复用
+#### 2.4.3 广义线性模型：GLM（IRLS 或梯度优化）
+
+**数学原理**：
+
+GLM 默认使用**迭代重加权最小二乘（IRLS）**：
+
+```
+1. 初始化 β̂₀
+2. 迭代直到收敛：
+   a. η = Xβ̂
+   b. μ = g⁻¹(η)
+   c. 工作残差 z = η + (y - μ) * g'(μ)
+   d. 权重 W = 1 / (Var(μ) * [g'(μ)]²)
+   e. 加权最小二乘: β̂ = (X'WX)⁻¹X'Wz
+```
+
+**关键代码引用**（`GLM.fit()`）：
+
+```python
+# statsmodels/genmod/generalized_linear_model.py:1178-1319
+def fit(
+    self,
+    start_params=None,
+    maxiter=100,
+    method="IRLS",  # 默认使用 IRLS
+    tol=1e-8,
+    scale=None,
+    **kwargs,
+):
+    """
+    Fits a generalized linear model for a given family.
+    
+    Parameters
+    ----------
+    method : str
+        Default is 'IRLS' for iteratively reweighted least squares.
+        Otherwise gradient optimization is used.
+    """
+    
+    self.scaletype = scale
+    
+    # ========== 方法 A：IRLS（默认） ==========
+    if method.lower() == "irls":
+        if cov_type.lower() == "eim":
+            cov_type = "nonrobust"
+        # 调用专门的 IRLS 实现
+        return self._fit_irls(
+            start_params=start_params,
+            maxiter=maxiter,
+            tol=tol,
+            scale=scale,
+            cov_type=cov_type,
+            cov_kwds=cov_kwds,
+            use_t=use_t,
+            **kwargs,
+        )
+    
+    # ========== 方法 B：梯度优化（备选） ==========
+    else:
+        self._optim_hessian = kwargs.get("optim_hessian")
+        self._tmp_like_exog = np.empty_like(self.exog, dtype=float)
+        
+        fit_ = self._fit_gradient(
+            start_params=start_params,
+            method=method,  # 如 "newton", "bfgs" 等
+            maxiter=maxiter,
+            tol=tol,
+            scale=scale,
+            **kwargs,
+        )
+        del self._optim_hessian
+        del self._tmp_like_exog
+        return fit_
+```
+
+**关键代码引用**（`GLM._fit_gradient()` 最终调用父类迭代优化）：
+
+```python
+# statsmodels/genmod/generalized_linear_model.py:1321-1365
+def _fit_gradient(
+    self,
+    start_params=None,
+    method="newton",
+    maxiter=100,
+    # ...
+):
+    """
+    Fits a generalized linear model for a given family iteratively
+    using the scipy gradient optimizers.
+    """
+    
+    # 先用 IRLS 做几次迭代获取好的起始值
+    if (max_start_irls > 0) and (start_params is None):
+        irls_rslt = self._fit_irls(
+            start_params=start_params,
+            maxiter=max_start_irls,  # 只迭代几次
+            tol=tol,
+            scale=1.0,
+            cov_type="nonrobust",
+            cov_kwds=None,
+            use_t=None,
+            **kwargs,
+        )
+        start_params = irls_rslt.params
+        del irls_rslt
+    
+    # 调用父类 LikelihoodModel.fit() 进行迭代优化
+    rslt = super().fit(
+        start_params=start_params,
+        maxiter=maxiter,
+        full_output=full_output,
+        method=method,
+        disp=disp,
+        **kwargs,
+    )
+    # ...
+    return rslt
+```
+
+#### 2.4.4 三种求解机制对比总结
+
+| 对比维度 | OLS/WLS/GLS（解析解） | Logit/Probit/Poisson（迭代优化） | GLM（IRLS） |
+|---------|----------------------|----------------------------------|-------------|
+| **数学问题** | 最小二乘 | 极大似然 | 极大似然 |
+| **目标函数** | RSS = Σ(y - Xβ)² | log L(β\|y,X) | log L(β\|y,X) |
+| **解的形式** | β̂ = (X'X)⁻¹X'y | 无闭式 | 每次迭代是 WLS |
+| **fit() 来源** | RegressionModel 重写 | 调用 LikelihoodModel.fit | 自定义 _fit_irls |
+| **method 参数** | `"pinv"`, `"qr"` | `"newton"`, `"bfgs"`, `"nm"`, 等 | `"IRLS"`（默认） |
+| **迭代次数** | **0 次** | 多次（通常 5-50） | 多次（通常 3-20） |
+| **起始参数** | 不需要 | 需要（默认全 0） | 可选 |
+| **收敛检查** | 不需要 | 需要 | 需要 |
+| **Hessian** | 不需要显式计算 | 需要（或近似） | 不需要 |
+| **失败模式** | X 列满秩时唯一解 | 不收敛、Hessian 奇异 | 不收敛、权重为 0 |
+| **代码位置** | `linear_model.py:284-415` | `base/model.py:362-651` | `genmod/generalized_linear_model.py` |
+
+### 2.5 统一的初始化流程
+
+**重要理解**：无论使用哪种求解机制，**模型初始化流程是相同的**——都通过 `from_formula` 调用 patsy 生成设计矩阵。
+
+```python
+# statsmodels/base/model.py:100-116
+def __init__(self, endog, exog=None, **kwargs):
+    missing = kwargs.pop("missing", "none")
+    hasconst = kwargs.pop("hasconst", None)
+    
+    # 处理数据（与求解机制无关）
+    self.data = self._handle_data(endog, exog, missing, hasconst, **kwargs)
+    
+    self.k_constant = self.data.k_constant
+    self.exog = self.data.exog      # 数值矩阵
+    self.endog = self.data.endog    # 数值数组
+    # ...
+```
+
+**关键理解**：
+- **Patsy 的职责终止于设计矩阵生成**：生成 `endog` 和 `exog` 数值矩阵后，patsy 的工作就完成了
+- **后续的求解机制与 patsy 无关**：完全由各模型类的 `fit()` 方法决定
+- **公式接口与数组接口等价**：`from_formula`（公式）和 `__init__(endog, exog)`（数组）最终到达相同的状态
+
+### 2.6 预测时的公式复用
 
 **核心功能**：在预测阶段重新应用相同的公式转换。
 
@@ -334,590 +701,468 @@ def fit(self, start_params=None, method="newton", maxiter=100, ...):
 def _transform_predict_exog(self, exog, transform=True):
     # ...
     if transform and hasattr(self.model, "formula") and (exog is not None):
+        # 获取保存的 model_spec（训练时的 DesignInfo）
         model_spec = (
-            getattr(self.model, "model_spec", None) or self.model.data.model_spec
+            getattr(self.model, "model_spec", None) 
+            or self.model.data.model_spec
         )
+        
         mgr = FormulaManager()
-        # ...
-        try:
-            exog = mgr.get_matrices(model_spec, exog, pandas=True, prediction=True)
-        except Exception as exc:
-            # 错误处理
-            raise exc.__class__(msg) from exc
-        # ...
+        # 使用 DesignInfo 处理新数据
+        # 这确保：
+        # 1. 分类变量使用相同的参考水平
+        # 2. 列顺序与训练时一致
+        # 3. 不重新解析公式字符串
+        exog = mgr.get_matrices(model_spec, exog, pandas=True, prediction=True)
     return exog, exog_index
 ```
 
 ---
 
-## 三、完整协作流程
+## 三、完整协作流程（修正版）
 
 ### 3.1 流程图概览
 
 ```
-用户代码: sm.OLS.from_formula("y ~ x1 + C(x2)", data=df)
+用户代码: sm.OLS.from_formula("y ~ x1 + C(x2)", data=df).fit()
          │
          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Statsmodels: Model.from_formula()                          │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ 1. 处理 subset 参数（数据子集筛选）                  │   │
-│  │ 2. 准备 eval_env（评估环境）                         │   │
-│  │ 3. 调用 handle_formula_data()                       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                          │                                   │
-│                          ▼                                   │
-┌─────────────────────────────────────────────────────────────┘
-│  Statsmodels: handle_formula_data()
-│  ┌─────────────────────────────────────────────────────┐
-│  │ 1. 创建 FormulaManager 实例                         │
-│  │ 2. 获取 NA_action（缺失值处理策略）                 │
-│  │ 3. 调用 mgr.get_matrices()                         │
-│  └─────────────────────────────────────────────────────┘
-│                          │
-│                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Statsmodels: FormulaManager.get_matrices()                 │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ 如果使用 patsy 引擎:                                 │   │
-│  │   - 调用 patsy.dmatrices() 或 patsy.dmatrix()      │   │
-│  │   - 获取 output[1].design_info 作为 model_spec     │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│  阶段 1：公式解析与设计矩阵生成（Patsy 负责）                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  Statsmodels: Model.from_formula()                                       │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 处理 subset 参数（数据子集筛选）                              │   │
+│  │ 2. 准备 eval_env（评估环境）                                     │   │
+│  │ 3. 调用 handle_formula_data()                                   │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                          │                                               │
+│                          ▼                                               │
+│  Statsmodels: handle_formula_data()                                      │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 创建 FormulaManager 实例                                       │   │
+│  │ 2. 获取 NA_action（缺失值处理策略）                               │   │
+│  │ 3. 调用 mgr.get_matrices()                                       │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                          │                                               │
+│                          ▼                                               │
+│  Statsmodels: FormulaManager.get_matrices()                             │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ 如果使用 patsy 引擎:                                               │   │
+│  │   - 调用 patsy.dmatrices("y ~ x1 + C(x2)", data, ...)          │   │
+│  │   - 获取 output[1].design_info 作为 model_spec                  │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                          │                                               │
+│                          ▼                                               │
+│  Patsy: 核心工作（公式 → 数值矩阵）                                      │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 公式解析: "y ~ x1 + C(x2)" → ModelDesc                       │   │
+│  │ 2. 因子评估: 从 DataFrame 提取数据，执行 C() 等函数             │   │
+│  │ 3. 编码处理: C(x2) → Treatment 编码（k-1 列虚拟变量）           │   │
+│  │ 4. 缺失处理: 应用 NA_action                                      │   │
+│  │ 5. 矩阵组装: 生成 endog (y) 和 exog (设计矩阵)                  │   │
+│  │ 6. 附加元数据: exog.design_info（列名、编码信息等）             │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                          │                                               │
+│                          ▼ 返回: (endog, exog), missing_mask, model_spec│
+└─────────────────────────────────────────────────────────────────────────┘
                           │
                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Patsy: 核心工作                                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ 1. 公式解析: ModelDesc.from_formula()               │   │
-│  │    - 解析 "y ~ x1 + C(x2)"                          │   │
-│  │    - 识别 LHS (y) 和 RHS (x1, C(x2))               │   │
-│  │                                                        │   │
-│  │ 2. 因子评估: EvalFactor.eval()                       │   │
-│  │    - 从 DataFrame 中提取数据                         │   │
-│  │    - 执行函数变换（如 log(x)）                       │   │
-│  │                                                        │   │
-│  │ 3. 分类编码: ContrastMatrix                          │   │
-│  │    - 对 C(x2) 应用 Treatment 编码                    │   │
-│  │    - 生成 k-1 个虚拟变量列                           │   │
-│  │                                                        │   │
-│  │ 4. 缺失值处理: NAAction._handle_NA_drop()           │   │
-│  │    - 识别包含 NA 的行                                 │   │
-│  │    - 删除或抛出异常                                   │   │
-│  │                                                        │   │
-│  │ 5. 构建设计矩阵: DesignMatrixBuilder                 │   │
-│  │    - 组装所有列                                       │   │
-│  │    - 附加 DesignInfo 元数据                          │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│  阶段 2：模型实例化（Statsmodels 负责）                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  Statsmodels: 继续处理 from_formula()                                    │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 处理 drop_cols（删除指定列）                                  │   │
+│  │ 2. 更新 kwargs: missing_idx, formula, model_spec                │   │
+│  │ 3. 实例化模型: cls(endog, exog, **kwargs)                       │   │
+│  │    - 此时 endog 和 exog 已经是纯数值矩阵！                       │   │
+│  │    - 与直接调用 OLS(endog, exog) 效果相同                        │   │
+│  │ 4. 附加原始数据: mod.data.frame = data                           │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                          │                                               │
+│                          ▼ 返回: model 实例                              │
+└─────────────────────────────────────────────────────────────────────────┘
                           │
-                          ▼ (返回: (endog, exog), missing_mask, model_spec)
-┌─────────────────────────────────────────────────────────────┐
-│  Statsmodels: 继续处理                                       │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ 1. 处理 drop_cols（删除指定列）                     │   │
-│  │ 2. 更新 kwargs: missing_idx, formula, model_spec   │   │
-│  │ 3. 实例化模型: cls(endog, exog, **kwargs)          │   │
-│  │ 4. 附加原始数据: mod.data.frame = data              │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                          │
-                          ▼ (返回: model 实例)
-┌─────────────────────────────────────────────────────────────┐
-│  用户代码: results = model.fit()                             │
-│                          │                                   │
-│                          ▼                                   │
-│  Statsmodels: 模型拟合和推断                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ 1. 优化算法寻找参数估计值                            │   │
-│  │ 2. 计算标准误、p值、置信区间                         │   │
-│  │ 3. 生成 Results 实例                                 │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+                          ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  阶段 3：参数估计（求解机制因模型类型而异）                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  用户代码: results = model.fit()                                          │
+│                          │                                               │
+│                          ▼                                               │
+│  ╔═══════════════════════════════════════════════════════════════════╗  │
+│  ║  重要：从此处开始，patsy 不再参与！完全是数值矩阵运算              ║  │
+│  ╚═══════════════════════════════════════════════════════════════════╝  │
+│                          │                                               │
+│                          ├─────────────┬─────────────┬─────────────┐  │
+│                          ▼             ▼             ▼             │  │
+│              ┌───────────────┐ ┌───────────────┐ ┌───────────────┐│  │
+│              │ OLS/WLS/GLS   │ │ GLM (默认)    │ │ Logit/Probit/ ││  │
+│              │ （解析解）    │ │ （IRLS）      │ │ Poisson 等    ││  │
+│              │               │ │               │ │（迭代优化）   ││  │
+│              └───────┬───────┘ └───────┬───────┘ └───────┬───────┘│  │
+│                      ▼                   ▼                   ▼        │  │
+│              ┌───────────────┐ ┌───────────────┐ ┌───────────────┐│  │
+│              │ 直接矩阵运算   │ │ IRLS 迭代     │ │ 梯度优化迭代   ││  │
+│              │               │ │               │ │               ││  │
+│              │ method="pinv" │ │ method="IRLS" │ │ method="newton"││  │
+│              │ 或 "qr"       │ │               │ │ 或 "bfgs" 等  ││  │
+│              │               │ │               │ │               ││  │
+│              │ β̂ = pinv(X)y │ │ while not    │ │ while not    ││  │
+│              │ 或 QR 求解    │ │   converged: │ │   converged: ││  │
+│              │               │ │   加权最小二乘│ │   梯度/Hessian││  │
+│              │ ⚠️ 0 次迭代   │ │ 更新参数      │ │ 更新参数      ││  │
+│              │               │ │               │ │               ││  │
+│              └───────┬───────┘ └───────┬───────┘ └───────┬───────┘│  │
+│                      ▼                   ▼                   ▼        │  │
+│              ┌───────────────────────────────────────────────────────┐│  │
+│              │              计算协方差矩阵、标准误、p 值              ││  │
+│              └───────────────────────────────────────────────────────┘│  │
+│                      │                                               │  │
+│                      ▼                                               │  │
+│              ┌───────────────────────────────────────────────────────┐│  │
+│              │              返回 RegressionResults 实例                ││  │
+│              └───────────────────────────────────────────────────────┘│  │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 3.2 详细时序说明
 
-**阶段 1：用户调用**
+**阶段 1：用户调用与公式解析**
+
 ```python
 import statsmodels.formula.api as smf
+
+# 方式 A：公式接口（内部调用 patsy）
 results = smf.ols("price ~ bedrooms + C(neighborhood) + sqft", data=df).fit()
+
+# 方式 B：数组接口（等价于方式 A 的后半段）
+# endog, exog = patsy.dmatrices("price ~ bedrooms + C(neighborhood) + sqft", df)
+# model = sm.OLS(endog, exog)
+# results = model.fit()
 ```
 
-**阶段 2：Statsmodels 入口处理**
+**阶段 2：`Model.from_formula()` 执行流程**
 
-`statsmodels/base/model.py:156-248` 的 `from_formula` 方法执行：
-1. **子集筛选**：如果提供了 `subset` 参数，使用 `data.loc[subset]` 筛选数据
+1. **子集筛选**：`data.loc[subset]`（如果提供）
 2. **评估环境准备**：
-   - 默认 `eval_env=2`（向上追溯 2 层栈帧）
-   - `eval_env=-1` 表示使用空环境
-   - 每次进入新函数层级，`eval_env += 1`
-3. **缺失值策略转换**：`missing="none"` 转换为 `"raise"`（因为 patsy 不支持 none）
+   - `eval_env=2`（默认）→ `eval_env=3`（进入函数层级 +1）
+3. **缺失值策略转换**：`missing="none"` → `"raise"`
+4. **调用 `handle_formula_data()`**：
+   - 创建 `FormulaManager`
+   - 获取 `NA_action`
+   - 调用 `mgr.get_matrices()`
 
-**阶段 3：调用公式处理函数**
+**阶段 3：`FormulaManager.get_matrices()` → Patsy**
 
-`statsmodels/formula/formulatools.py:15-76` 的 `handle_formula_data` 函数：
-1. 创建 `FormulaManager` 实例
-2. 获取 `NA_action`（根据 `missing` 参数）
-3. 调用 `mgr.get_matrices()`
+**Patsy 内部流程**：
+1. **公式解析**：`patsy.ModelDesc.from_formula()`
+2. **因子评估**：从 DataFrame 提取数据，执行 `C()` 等函数
+3. **状态确定**：确定分类变量的类别、参考水平等
+4. **编码应用**：生成对比矩阵，扩展为多列
+5. **矩阵组装**：按顺序组装所有列
+6. **缺失值处理**：应用 `NA_action`
+7. **返回结果**：`(endog, exog)` + `design_info`
 
-**阶段 4：FormulaManager 分发到 Patsy**
+**阶段 4：模型实例化（与求解机制无关）**
 
-`statsmodels/formula/_manager.py:417-496` 的 `get_matrices` 方法：
-
-**判断使用哪个公式函数**：
 ```python
-if (
-    isinstance(formula, (patsy.design_info.DesignInfo, patsy.desc.ModelDesc))
-    or "~" not in formula
-    or formula.strip().startswith("~")
-):
-    # 单侧公式：仅 dmatrix
-    output = patsy.dmatrix(formula, data, ...)
-else:
-    # 双侧公式：dmatrices 返回 (endog, exog)
-    output = patsy.dmatrices(formula, data, ...)
-```
-
-**参数传递给 patsy**：
-- `eval_env`：评估环境（调整后的栈帧深度或字典）
-- `return_type`：`"dataframe"` 或 `"matrix"`
-- `NA_action`：缺失值处理策略
-
-**阶段 5：Patsy 内部处理流程**
-
-1. **公式解析** (`patsy/desc.py:ModelDesc.from_formula`)
-   - 使用 `patsy.parse_formula()` 解析字符串
-   - 构建 `ModelDesc` 对象，包含 `lhs_termlist` 和 `rhs_termlist`
-   - 每个 `Term` 包含多个 `EvalFactor`
-
-2. **因子评估** (`patsy/eval.py:EvalFactor`)
-   - 从 DataFrame 或评估环境中提取数据
-   - 执行公式中的函数调用（如 `log(x)`、`C(x)`）
-   - `C()` 是特殊函数，标记分类变量并指定编码方式
-
-3. **状态转换** (`patsy/build.py:DesignMatrixBuilder`)
-   - 为每个因子确定"状态"（如分类变量的类别、中心化参数等）
-   - 这些状态存储在 `DesignInfo` 中，供预测时复用
-
-4. **编码应用** (`patsy/contrasts.py`)
-   - 对于分类因子，应用对比矩阵
-   - 默认 `Treatment` 编码：k 个类别 → k-1 列
-   - 截距列默认添加（除非公式中有 `-1` 或 `0 +`）
-
-5. **矩阵组装** (`patsy/build.py`)
-   - 按公式顺序组装所有列
-   - 处理缺失值（根据 `NA_action`）
-   - 返回 `DesignMatrix` 对象（带有 `design_info` 属性）
-
-**阶段 6：返回结果给 Statsmodels**
-
-`get_matrices` 方法的返回处理：
-```python
-if isinstance(output, tuple):
-    # dmatrices 返回 (lhs, rhs)
-    self._spec = output[1].design_info  # 保存 RHS 的 DesignInfo
-else:
-    # dmatrix 返回单个矩阵
-    self._spec = output.design_info
-
-# 记录缺失值掩码
-if isinstance(na_action, NAAction):
-    self._missing_mask = getattr(na_action, "missing_mask", None)
-
-return output
-```
-
-**阶段 7：模型实例化**
-
-`from_formula` 方法的最后步骤：
-```python
-# 附加公式相关信息到 kwargs
+# statsmodels/base/model.py:236-248
 kwargs.update({
     "missing_idx": missing_idx,
     "missing": missing,
-    "formula": formula,      # 用于反序列化
-    "model_spec": model_spec,  # DesignInfo，用于预测
+    "formula": formula,
+    "model_spec": model_spec,  # DesignInfo
 })
 
-# 实例化具体模型类（如 OLS）
+# 实例化模型
 mod = cls(endog, exog, *args, **kwargs)
-
-# 附加额外信息
-mod.formula = formula
-mod.data.frame = data  # 保存原始数据引用
-
-return mod
+# 此时：
+# - mod.endog = endog（数值数组）
+# - mod.exog = exog（数值矩阵）
+# - mod.model_spec = DesignInfo（元数据，供预测使用）
 ```
 
-**阶段 8：用户调用 fit()**
+**阶段 5：`fit()` 调用——三种不同路径**
 
-用户执行 `model.fit()` 后，statsmodels 进行：
-1. **数据准备**：`endog` 和 `exog` 已经是数值矩阵
-2. **参数估计**：使用优化算法最小化损失函数（OLS 使用最小二乘，MLE 使用极大似然）
-3. **推断统计**：计算标准误、t 值、p 值、置信区间
-4. **结果包装**：返回 `RegressionResults` 实例
+#### 路径 A：OLS/WLS/GLS（解析解）
 
-**阶段 9：预测时的公式复用**
+**调用链**：
+```
+model.fit()
+    │
+    ▼
+RegressionModel.fit()  # 重写了 LikelihoodModel.fit()
+    │
+    ├──► 方法 1：method="pinv"（默认）
+    │       │
+    │       ├──► pinv_wexog = pinv(wexog)
+    │       ├──► normalized_cov_params = pinv_wexog @ pinv_wexog.T
+    │       └──► beta = pinv_wexog @ wendog  # ⚠️ 直接计算，无迭代！
+    │
+    └──► 方法 2：method="qr"
+            │
+            ├──► Q, R = qr(wexog)
+            ├──► effects = Q.T @ wendog
+            └──► beta = solve(R, effects)  # ⚠️ 解三角方程组，无迭代！
+    │
+    └──► 返回 RegressionResults
+```
 
-当用户调用 `results.predict(new_data)` 时：
+#### 路径 B：Logit/Probit/Poisson（迭代优化）
+
+**调用链**：
+```
+model.fit()
+    │
+    ▼
+DiscreteModel.fit()
+    │
+    ├──► callback = self._check_perfect_pred  # 完美预测检测
+    │
+    └──► super().fit(...)  # 调用 LikelihoodModel.fit()
+            │
+            ▼
+        LikelihoodModel.fit()  # 真正的迭代优化
+            │
+            ├──► 准备 start_params（默认全 0）
+            │
+            ├──► 定义目标函数: f(params) = -loglike(params) / nobs
+            │
+            ├──► 定义梯度: score(params)
+            ├──► 定义 Hessian: hess(params)
+            │
+            ├──► optimizer._fit(...)  # 调用 scipy 优化器
+            │       │
+            │       ├──► method="newton": Newton-Raphson
+            │       ├──► method="bfgs": BFGS（拟牛顿）
+            │       └──► method="nm": Nelder-Mead（单纯形）
+            │
+            ├──► 检查收敛 (retvals["converged"])
+            │
+            ├──► 计算协方差: Cov = -H⁻¹
+            │
+            └──► 返回 LikelihoodModelResults
+```
+
+#### 路径 C：GLM（IRLS 或梯度优化）
+
+**调用链（默认 method="IRLS"）**：
+```
+model.fit()
+    │
+    ▼
+GLM.fit()
+    │
+    └──► if method.lower() == "irls":
+            │
+            └──► self._fit_irls(...)  # 迭代重加权最小二乘
+                    │
+                    ├──► 初始化 mu, eta
+                    │
+                    └──► while deviance 变化 > tol:
+                            │
+                            ├──► 计算工作残差 z = eta + (y - mu) * g'(mu)
+                            ├──► 计算权重 W = 1 / (Var(mu) * [g'(mu)]²)
+                            ├──► 加权最小二乘: beta = (X'WX)⁻¹X'Wz
+                            └──► 更新 eta = X @ beta, mu = g⁻¹(eta)
+```
+
+### 3.3 预测时的公式复用
+
+**关键点**：预测时需要**相同的设计矩阵生成过程**，使用保存的 `DesignInfo`。
+
 ```python
-# statsmodels/base/model.py:1149-1207
+# statsmodels/base/model.py:1164-1189
 def _transform_predict_exog(self, exog, transform=True):
     if transform and hasattr(self.model, "formula") and (exog is not None):
-        # 获取保存的 model_spec (DesignInfo)
-        model_spec = getattr(self.model, "model_spec", None)
+        # 获取保存的 model_spec（训练时的 DesignInfo）
+        model_spec = (
+            getattr(self.model, "model_spec", None) 
+            or self.model.data.model_spec
+        )
         
         mgr = FormulaManager()
-        # 使用相同的公式规格处理新数据
+        # 使用 DesignInfo 处理新数据
+        # 这确保：
+        # 1. 分类变量使用相同的参考水平
+        # 2. 列顺序与训练时一致
+        # 3. 不重新解析公式字符串
         exog = mgr.get_matrices(model_spec, exog, pandas=True, prediction=True)
-        # ...
 ```
-
-**关键点**：预测时使用的是保存的 `model_spec`（即 `DesignInfo`），而不是重新解析公式字符串。这确保了：
-- 分类变量使用相同的编码（相同的参考水平）
-- 连续变量使用相同的变换参数（如相同的中心化均值）
-- 列顺序与训练时一致
 
 ---
 
 ## 四、契约边界分析
 
-### 4.1 输入契约
-
-**Statsmodels → Patsy 的输入参数**：
-
-| 参数 | 类型 | 说明 | 代码位置 |
-|------|------|------|----------|
-| `formula` | `str` 或 `patsy.ModelDesc` 或 `patsy.DesignInfo` | 公式字符串或预解析的公式对象 | `_manager.py:474-486` |
-| `data` | `DataFrame` 或 `dict` 或 `(Y, X)` 元组 | 包含变量的数据 | `_manager.py:446-465`, `formulatools.py:45-66` |
-| `eval_env` | `int` 或 `dict` 或 `patsy.EvalEnvironment` | 公式中函数/变量的评估环境 | `_manager.py:458-472` |
-| `return_type` | `Literal["dataframe", "matrix"]` | 返回矩阵的类型 | `_manager.py:461` |
-| `NA_action` | `patsy.missing.NAAction` | 缺失值处理策略 | `_manager.py:463-464` |
-
-**关键代码**：
-```python
-# statsmodels/formula/_manager.py:460-486
-if self._using_patsy:
-    return_type = "dataframe" if pandas else "matrix"
-    kwargs = {}
-    if na_action:
-        kwargs["NA_action"] = na_action
-    if isinstance(eval_env, Mapping):
-        _eval_env = patsy.eval.EvalEnvironment(
-            [{key: val} for key, val in eval_env.items()]
-        )
-    else:
-        _eval_env = eval_env
-    # ...
-    output = patsy.dmatrices(formula, data, eval_env=_eval_env, 
-                              return_type=return_type, **kwargs)
-```
-
-### 4.2 输出契约
-
-**Patsy → Statsmodels 的输出**：
-
-#### 4.2.1 主要返回值
-
-**情况 1：双侧公式（`dmatrices`）**
-```python
-# 返回值: (endog, exog) 元组
-# endog: DesignMatrix 或 DataFrame - 因变量矩阵
-# exog: DesignMatrix 或 DataFrame - 自变量设计矩阵
-```
-
-**情况 2：单侧公式（`dmatrix`）**
-```python
-# 返回值: exog（单个 DesignMatrix 或 DataFrame）
-```
-
-#### 4.2.2 元数据：DesignInfo
-
-**这是最重要的契约对象**，存储在 `exog.design_info` 属性中。
-
-**关键属性**（`statsmodels/formula/_manager.py` 中的使用方式）：
-
-| 属性 | 类型 | 用途 | 使用位置 |
-|------|------|------|----------|
-| `.column_names` | `list[str]` | 设计矩阵的列名（包括编码后的虚拟变量） | `_manager.py:812` |
-| `.term_names` | `list[str]` | 公式中的原始项名（如 `"C(x2)"`） | `_manager.py:794` |
-| `.term_name_slices` | `dict[str, slice]` | 每个项对应的列切片 | `_manager.py:831` |
-| `.terms` | `list[Term]` | 项对象列表 | `_manager.py:706, 724` |
-| `.factor_infos` | `dict` | 每个因子的元信息（类型、类别等） | `_manager.py:933` |
-| `.term_codings` | `dict` | 每个项的编码信息（对比矩阵等） | `_manager.py:956` |
-
-**关键方法**：
-
-| 方法 | 功能 | 使用位置 |
-|------|------|----------|
-| `.slice(term)` | 获取某个项对应的列切片 | `_manager.py:875` |
-| `.linear_constraint(constraints)` | 解析线性约束字符串 | `_manager.py:618-626` |
-| `.describe()` | 返回公式的可读描述 | `_manager.py:912` |
-| `.subset(cols)` | 创建列子集的新 DesignInfo | `base/model.py:234` |
-
-**DesignInfo 在预测中的关键作用**：
-```python
-# statsmodels/base/model.py:1177-1189
-def _transform_predict_exog(self, exog, transform=True):
-    if transform and hasattr(self.model, "formula"):
-        # 使用保存的 model_spec（即训练时的 DesignInfo）
-        model_spec = getattr(self.model, "model_spec", None)
-        mgr = FormulaManager()
-        # 直接使用 model_spec 处理新数据，而不是重新解析公式
-        exog = mgr.get_matrices(model_spec, exog, pandas=True, prediction=True)
-```
-
-#### 4.2.3 缺失值信息
-
-```python
-# statsmodels/formula/_manager.py:37
-self.missing_mask = total_mask  # 布尔数组，True 表示该行被删除
-
-# statsmodels/formula/formulatools.py:68-70
-missing_mask = mgr.missing_mask
-if not np.any(missing_mask):
-    missing_mask = None
-```
-
-### 4.3 数据流契约
+### 4.1 Patsy 与 Statsmodels 的职责边界
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                        数据流方向                                │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  Statsmodels 用户层                                            │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  smf.ols("y ~ x1 + C(x2)", data=df)                    │  │
-│  │         │                                                │  │
-│  │         ▼                                                │  │
-│  │  Model.from_formula()                                   │  │
-│  │  - 准备 eval_env (int 或 dict)                         │  │
-│  │  - 准备 missing 策略                                     │  │
-│  │  - 准备 subset 数据筛选                                  │  │
-│  └────────────────────────────────────────────────────────┘  │
-│                          │                                     │
-│                          ▼ (公式字符串, DataFrame, eval_env)  │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  Statsmodels 抽象层 (FormulaManager)                          │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  - 选择引擎: patsy 或 formulaic                         │  │
-│  │  - 统一参数格式                                          │  │
-│  │  - 包装返回值                                            │  │
-│  └────────────────────────────────────────────────────────┘  │
-│                          │                                     │
-│                          ▼                                     │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  Patsy 层                                                     │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  输入:                                                    │  │
-│  │  - formula: str ("y ~ x1 + C(x2)")                      │  │
-│  │  - data: DataFrame 或 dict                               │  │
-│  │  - eval_env: int 或 EvalEnvironment                      │  │
-│  │  - NA_action: NAAction 实例                              │  │
-│  │                                                           │  │
-│  │  处理:                                                    │  │
-│  │  1. 公式解析 → ModelDesc                                 │  │
-│  │  2. 因子评估 → 提取/变换数据                            │  │
-│  │  3. 编码处理 → 分类变量对比编码                         │  │
-│  │  4. 缺失处理 → 应用 NA_action                           │  │
-│  │  5. 矩阵组装 → 构建设计矩阵                             │  │
-│  │                                                           │  │
-│  │  输出:                                                    │  │
-│  │  - (endog, exog): (DesignMatrix, DesignMatrix)          │  │
-│  │    或单个 DesignMatrix (单侧公式)                        │  │
-│  │  - exog.design_info: DesignInfo (元数据)                │  │
-│  └────────────────────────────────────────────────────────┘  │
-│                          │                                     │
-│                          ▼ (设计矩阵 + DesignInfo)            │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  Statsmodels 模型层                                            │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  输入:                                                    │  │
-│  │  - endog: 数值数组 (因变量)                              │  │
-│  │  - exog: 数值数组 (设计矩阵)                             │  │
-│  │  - model_spec: DesignInfo (元数据)                      │  │
-│  │  - missing_idx: 缺失值掩码                               │  │
-│  │                                                           │  │
-│  │  处理:                                                    │  │
-│  │  - 数据验证和类型转换                                    │  │
-│  │  - 检测常数项                                            │  │
-│  │  - 保存元数据供后续使用                                  │  │
-│  │                                                           │  │
-│  │  输出:                                                    │  │
-│  │  - Model 实例 (可调用 fit())                             │  │
-│  └────────────────────────────────────────────────────────┘  │
-│                          │                                     │
-│                          ▼                                     │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  Statsmodels 估计层                                            │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  model.fit()                                             │  │
-│  │  - 使用数值矩阵进行估计                                  │  │
-│  │  - 不再需要公式信息                                      │  │
-│  │  - 但保留 model_spec 供预测使用                         │  │
-│  └────────────────────────────────────────────────────────┘  │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              职责边界图                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                         PATSY 职责区                              │   │
+│  ├─────────────────────────────────────────────────────────────────┤   │
+│  │                                                                   │   │
+│  │  输入:                                                            │   │
+│  │  • formula: str ("y ~ x1 + C(x2)")                              │   │
+│  │  • data: DataFrame/dict                                          │   │
+│  │  • eval_env: 评估环境                                             │   │
+│  │  • NA_action: 缺失值策略                                          │   │
+│  │                                                                   │   │
+│  │  处理:                                                            │   │
+│  │  1. 公式字符串解析 → ModelDesc                                    │   │
+│  │  2. 因子评估: 从数据提取、函数变换                                │   │
+│  │  3. 编码处理: 分类变量对比编码                                    │   │
+│  │  4. 缺失值处理: 应用 NA_action                                   │   │
+│  │  5. 矩阵组装: 构建设计矩阵                                        │   │
+│  │                                                                   │   │
+│  │  输出:                                                            │   │
+│  │  • endog: 数值数组 (因变量)                                       │   │
+│  │  • exog: 数值矩阵 (设计矩阵)                                      │   │
+│  │  • design_info: 元数据（列名、编码信息、项名等）                  │   │
+│  │  • missing_mask: 缺失值掩码                                       │   │
+│  │                                                                   │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                    │                                      │
+│                                    ▼ 【数值矩阵交接点】                    │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                     STATSMODELS 职责区                           │   │
+│  ├─────────────────────────────────────────────────────────────────┤   │
+│  │                                                                   │   │
+│  │  【模型层】                                                       │   │
+│  │  输入: endog (数值), exog (数值), model_spec (元数据)           │   │
+│  │  处理:                                                            │   │
+│  │  • 数据验证和类型转换                                             │   │
+│  │  • 检测常数项 (hasconst)                                         │   │
+│  │  • 保存元数据供预测使用                                           │   │
+│  │  输出: Model 实例                                                 │   │
+│  │                                                                   │   │
+│  ├─────────────────────────────────────────────────────────────────┤   │
+│  │                                                                   │   │
+│  │  【估计层】—— 与 Patsy 完全无关！                                │   │
+│  │  输入: self.exog (数值矩阵), self.endog (数值数组)               │   │
+│  │                                                                   │   │
+│  │  三种路径:                                                        │   │
+│  │                                                                   │   │
+│  │  路径 A: OLS/WLS/GLS（解析解）                                  │   │
+│  │  ┌─────────────────────────────────────────────────────────┐   │   │
+│  │  │ β̂ = pinv(X) @ y  或  QR 分解求解                       │   │   │
+│  │  │ ⚠️ 0 次迭代，直接矩阵运算                                │   │   │
+│  │  └─────────────────────────────────────────────────────────┘   │   │
+│  │                                                                   │   │
+│  │  路径 B: Logit/Probit/Poisson（迭代优化）                      │   │
+│  │  ┌─────────────────────────────────────────────────────────┐   │   │
+│  │  │ while not converged:                                    │   │   │
+│  │  │     计算 gradient = score(params)                       │   │   │
+│  │  │     计算 Hessian = hessian(params)                     │   │   │
+│  │  │     更新 params (Newton 步或拟牛顿步)                  │   │   │
+│  │  └─────────────────────────────────────────────────────────┘   │   │
+│  │                                                                   │   │
+│  │  路径 C: GLM（IRLS）                                            │   │
+│  │  ┌─────────────────────────────────────────────────────────┐   │   │
+│  │  │ while not converged:                                    │   │   │
+│  │  │     计算工作残差 z 和权重 W                             │   │   │
+│  │  │     加权最小二乘: β̂ = (X'WX)⁻¹X'Wz                  │   │   │
+│  │  └─────────────────────────────────────────────────────────┘   │   │
+│  │                                                                   │   │
+│  ├─────────────────────────────────────────────────────────────────┤   │
+│  │                                                                   │   │
+│  │  【预测层】                                                       │   │
+│  │  输入: new_data (DataFrame/dict)                                 │   │
+│  │  处理:                                                            │   │
+│  │  • 使用保存的 model_spec (DesignInfo)                            │   │
+│  │  • 调用 FormulaManager.get_matrices()                            │   │
+│  │  → 再次进入 Patsy 处理新数据（但使用相同的编码规则）             │   │
+│  │                                                                   │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.4 关键契约接口总结
+### 4.2 关键理解：Patsy 与求解机制的关系
 
-#### 4.4.1 公式接口
+**重要结论**：
 
-**Patsy 提供的核心函数**：
-```python
-# 双侧公式：因变量 ~ 自变量
-patsy.dmatrices(formula, data, eval_env=0, return_type="matrix", NA_action=None)
-# 返回: (lhs_design_matrix, rhs_design_matrix)
+| 维度 | 说明 |
+|------|------|
+| **Patsy 的终止边界** | 设计矩阵生成完成后，patsy 的工作就结束了 |
+| **求解机制与 Patsy 无关** | `fit()` 方法只使用 `self.exog` 和 `self.endog` 数值矩阵 |
+| **公式接口与数组接口等价** | `smf.ols(formula, data).fit()` 和 `sm.OLS(endog, exog).fit()` 到达相同的求解路径 |
+| **唯一区别** | 公式接口保存了 `model_spec`（DesignInfo），供预测时使用 |
 
-# 单侧公式：仅自变量（用于预测或仅生成 X）
-patsy.dmatrix(formula_like, data, eval_env=0, return_type="matrix")
-# 返回: design_matrix
-
-# 解析公式但不构建矩阵
-patsy.ModelDesc.from_formula(formula, eval_env=0)
-# 返回: ModelDesc 对象
-```
-
-**Statsmodels 对这些函数的包装**：
-```python
-# statsmodels/formula/_manager.py:417-496
-def get_matrices(self, formula, data, eval_env=0, pandas=True, 
-                  na_action=None, prediction=False):
-    if self._using_patsy:
-        return_type = "dataframe" if pandas else "matrix"
-        # ...
-        if "~" not in formula or formula.strip().startswith("~"):
-            output = patsy.dmatrix(formula, data, eval_env=_eval_env, 
-                                    return_type=return_type, **kwargs)
-        else:
-            output = patsy.dmatrices(formula, data, eval_env=_eval_env, 
-                                      return_type=return_type, **kwargs)
-        # 提取 DesignInfo
-        if isinstance(output, tuple):
-            self._spec = output[1].design_info
-        else:
-            self._spec = output.design_info
-        return output
-```
-
-#### 4.4.2 设计信息接口
-
-**DesignInfo 的核心作用是"记住"训练时的数据处理方式**，确保预测时使用完全相同的转换。
-
-**Statsmodels 中保存 DesignInfo 的位置**：
-```python
-# 位置 1: Model 实例
-# statsmodels/base/model.py:236-242
-kwargs.update({
-    "missing_idx": missing_idx,
-    "missing": missing,
-    "formula": formula,
-    "model_spec": model_spec,  # 这里
-})
-mod = cls(endog, exog, *args, **kwargs)
-
-# 位置 2: Model.data 属性
-# statsmodels/base/data.py 中也会保存
-
-# 位置 3: Results 实例
-# 通过 model 属性访问
-results.model.model_spec
-```
-
-**使用 DesignInfo 进行预测**：
-```python
-# statsmodels/formula/_manager.py:417-496 中的 prediction 分支
-if prediction:
-    if hasattr(_formula, "rhs"):
-        _formula = _formula.rhs  # 只使用公式右侧
-
-# 可以直接传入 DesignInfo 给 get_matrices
-# 这会复用训练时的所有编码参数
-```
-
-#### 4.4.3 线性约束接口
-
-**Patsy 提供线性约束字符串解析**：
-```python
-# statsmodels/formula/_manager.py:618-626
-if self._using_patsy:
-    from patsy.design_info import DesignInfo
-    # 使用 DesignInfo 解析约束字符串
-    lc = DesignInfo(variable_names).linear_constraint(constraints)
-    return LinearConstraintValues(
-        constraint_matrix=lc.coefs,
-        constraint_values=lc.constants,
-        variable_names=lc.variable_names,
-    )
-```
-
-**使用示例**：
-```python
-# 用户可以这样写
-model.fit_constrained("x1 = x2")
-# patsy 会解析为对应的约束矩阵
-```
+**这意味着**：
+- 无论使用 OLS（解析解）还是 Logit（迭代优化），公式处理流程完全相同
+- `fit()` 的实现差异只与模型类型有关，与是否使用公式无关
+- patsy 只负责"数据准备"，不负责"模型求解"
 
 ---
 
 ## 五、代码位置索引
 
-### 5.1 Statsmodels 关键文件
+### 5.1 关键文件与职责
 
-| 文件路径 | 职责 |
-|----------|------|
+| 文件路径 | 主要职责 |
+|----------|----------|
 | `statsmodels/formula/_manager.py` | 公式引擎抽象层（FormulaManager） |
 | `statsmodels/formula/formulatools.py` | 公式数据处理（handle_formula_data） |
-| `statsmodels/formula/api.py` | 公式 API 入口（导出 from_formula 快捷方式） |
-| `statsmodels/formula/__init__.py` | 公式模块初始化（options 配置） |
-| `statsmodels/base/model.py` | 模型基类（from_formula 方法） |
-| `statsmodels/compat/patsy.py` | Patsy 兼容性补丁 |
+| `statsmodels/base/model.py` | 模型基类（from_formula、LikelihoodModel.fit 迭代优化） |
+| `statsmodels/regression/linear_model.py` | 线性回归（OLS/WLS/GLS.fit 解析解） |
+| `statsmodels/discrete/discrete_model.py` | 离散选择模型（调用父类迭代优化） |
+| `statsmodels/genmod/generalized_linear_model.py` | GLM（IRLS 或梯度优化） |
 
 ### 5.2 关键代码行号
 
-**FormulaManager 核心方法**：
-- `__init__`: `_manager.py:206-257` - 初始化和引擎选择
-- `get_matrices`: `_manager.py:417-496` - 调用 patsy 生成设计矩阵
-- `get_linear_constraints`: `_manager.py:598-655` - 线性约束解析
-- `get_model_spec`: `_manager.py:835-857` - 从 DataFrame 获取 DesignInfo
-- `get_na_action`: `_manager.py:726-748` - 获取缺失值处理策略
+#### 公式处理相关
 
-**Model.from_formula 流程**：
-- 入口: `base/model.py:156`
-- 子集处理: `base/model.py:198-199`
-- eval_env 处理: `base/model.py:200-206`
-- 缺失值处理: `base/model.py:207-209`
-- 调用 handle_formula_data: `base/model.py:211`
-- 验证 endog: `base/model.py:213-220`
-- 处理 drop_cols: `base/model.py:221-234`
-- 附加元数据: `base/model.py:236-243`
-- 实例化模型: `base/model.py:244`
-- 附加额外信息: `base/model.py:245-247`
+| 功能 | 代码位置 |
+|------|----------|
+| FormulaManager 初始化 | `_manager.py:188-257` |
+| get_matrices（调用 patsy） | `_manager.py:417-496` |
+| patsy.dmatrix/dmatrices 调用 | `_manager.py:480-486` |
+| DesignInfo 提取 | `_manager.py:487-490` |
+| handle_formula_data | `formulatools.py:15-76` |
+| Model.from_formula 入口 | `base/model.py:156-248` |
 
-**预测时的公式处理**：
-- `_transform_predict_exog`: `base/model.py:1149-1207`
-- 使用保存的 model_spec: `base/model.py:1161-1163`
-- 调用 get_matrices: `base/model.py:1181`
+#### 参数估计相关（修正版）
 
-### 5.3 Patsy 集成点
+| 模型类型 | 方法 | 代码位置 | 求解方式 |
+|----------|------|----------|----------|
+| **线性回归** | `RegressionModel.fit()` | `linear_model.py:284-415` | 解析解（pinv 或 QR） |
+| **似然模型基类** | `LikelihoodModel.fit()` | `base/model.py:362-651` | 迭代优化（Newton/BFGS 等） |
+| **离散选择** | `DiscreteModel.fit()` | `discrete_model.py:242-274` | 调用父类迭代优化 |
+| **GLM（默认）** | `GLM.fit()` + `_fit_irls()` | `genmod/generalized_linear_model.py:1178-1319` | IRLS 迭代 |
+| **GLM（备选）** | `GLM._fit_gradient()` | `genmod/generalized_linear_model.py:1321-1365` | 调用父类迭代优化 |
 
-| 集成点 | 代码位置 | 说明 |
-|--------|----------|------|
-| Patsy 导入 | `_manager.py:24-28` | 尝试导入 patsy，设置 HAVE_PATSY |
-| NAAction 继承 | `_manager.py:30-38` | 继承并 monkey-patch patsy 的 NAAction |
-| dmatrix 调用 | `_manager.py:480-482` | 单侧公式使用 dmatrix |
-| dmatrices 调用 | `_manager.py:484-486` | 双侧公式使用 dmatrices |
-| DesignInfo 提取 | `_manager.py:487-490` | 从返回值提取 design_info |
-| ModelDesc.from_formula | `_manager.py:765` | 解析公式字符串 |
-| DesignInfo.linear_constraint | `_manager.py:621` | 解析线性约束 |
-| 兼容性补丁 | `compat/patsy.py:15-22` | 修复 pandas CategoricalDtype 检测 |
+### 5.3 类继承体系
+
+```
+base.Model（最基类，定义 from_formula）
+│
+└── base.LikelihoodModel（定义迭代优化 fit()）
+    │
+    ├── RegressionModel（⚠️ 重写 fit()，使用解析解）
+    │   ├── GLS
+    │   │   └── WLS
+    │   │       └── OLS
+    │   └── GLSAR
+    │
+    ├── DiscreteModel（不重写 fit()，调用父类迭代优化）
+    │   ├── BinaryModel
+    │   │   ├── Logit
+    │   │   └── Probit
+    │   └── CountModel
+    │       ├── Poisson
+    │       └── NegativeBinomial
+    │
+    └── GLM（自定义 fit()，默认 IRLS，可选梯度优化）
+```
 
 ---
 
@@ -928,186 +1173,180 @@ model.fit_constrained("x1 = x2")
 | 层级 | 组件 | 核心职责 |
 |------|------|----------|
 | **公式层** | **Patsy** | 1. 公式字符串解析<br>2. 因子评估和函数变换<br>3. 分类变量编码（对比矩阵）<br>4. 缺失值处理<br>5. 设计矩阵组装<br>6. 元数据记录（DesignInfo） |
-| **抽象层** | **Statsmodels FormulaManager** | 1. 统一 patsy/formulaic 接口<br>2. 引擎选择和配置<br>3. 参数格式转换<br>4. 结果统一包装 |
-| **模型层** | **Statsmodels Model** | 1. 提供 from_formula 入口<br>2. 数据验证和预处理<br>3. 保存元数据（model_spec, formula）<br>4. 实例化模型对象 |
-| **估计层** | **Statsmodels Fit** | 1. 使用数值矩阵进行参数估计<br>2. 统计推断（标准误、p值等）<br>3. 结果包装 |
-| **预测层** | **Statsmodels Predict** | 1. 复用保存的 DesignInfo<br>2. 对新数据应用相同的转换<br>3. 确保一致性 |
+| **抽象层** | **Statsmodels FormulaManager** | 1. 统一 patsy/formulaic 接口<br>2. 引擎选择和配置 |
+| **模型层** | **Statsmodels Model** | 1. 提供 from_formula 入口<br>2. 数据验证和预处理<br>3. 保存元数据（model_spec, formula） |
+| **估计层** | **Statsmodels Fit** | 三种求解机制：<br>• **OLS/WLS/GLS**：解析解（0 次迭代）<br>• **Logit/Probit/Poisson**：迭代优化<br>• **GLM**：IRLS（迭代重加权最小二乘） |
+| **预测层** | **Statsmodels Predict** | 1. 复用保存的 DesignInfo<br>2. 对新数据应用相同的转换 |
 
-### 6.2 关键契约边界
+### 6.2 关键修正点
 
-**输入边界（Statsmodels → Patsy）**：
-- **公式**：字符串或预解析的公式对象
-- **数据**：DataFrame、字典或元组
-- **评估环境**：整数（栈帧深度）或字典
-- **缺失值策略**：NAAction 实例
-
-**输出边界（Patsy → Statsmodels）**：
-- **设计矩阵**：DesignMatrix 或 DataFrame（数值类型）
-- **元数据**：DesignInfo（最重要的契约对象）
-  - 列名映射
-  - 项名映射
-  - 编码信息
-  - 对比矩阵
-- **缺失值信息**：missing_mask 布尔数组
-
-**持久化边界**：
-- `formula` 字符串：用于人类可读和调试
-- `model_spec` (DesignInfo)：用于预测和约束
-- `data.frame`：原始数据引用
+| 之前的错误描述 | 正确的实际实现 |
+|----------------|----------------|
+| OLS 使用迭代优化（Newton、BFGS 等） | OLS 使用解析解（pinv 或 QR 分解），**0 次迭代** |
+| OLS.fit() 的 method 参数支持 `"newton"` | OLS.fit() 只支持 `"pinv"` 和 `"qr"` |
+| OLS 需要 `start_params` | OLS **不需要**起始参数 |
+| 所有模型的 fit() 流程相似 | 线性回归与似然模型的 fit() **完全不同** |
 
 ### 6.3 设计亮点
 
-1. **引擎抽象**：FormulaManager 允许在 patsy 和 formulaic 之间切换，而用户代码无需修改
-2. **DesignInfo 持久化**：通过保存训练时的元数据，确保预测时使用完全相同的数据转换
-3. **分层设计**：公式处理与统计估计完全解耦，模型的 fit() 方法只处理数值矩阵
-4. **缺失值追踪**：通过 monkey-patch 的 NAAction，能够追踪哪些行因缺失值被删除
-5. **灵活的评估环境**：支持栈帧深度和字典两种评估环境，适应不同使用场景
+1. **清晰的职责边界**：Patsy 只负责公式→矩阵，Statsmodels 只负责矩阵→估计
+2. **解析解与迭代解分离**：RegressionModel 重写 fit()，使用高效的解析解
+3. **DesignInfo 持久化**：通过保存训练时的元数据，确保预测时使用完全相同的数据转换
+4. **统一的初始化流程**：无论使用哪种求解机制，`from_formula` → `__init__` 流程完全相同
+5. **公式接口与数组接口等价**：用户可以自由选择使用公式或直接传入数值矩阵
 
 ### 6.4 实际使用中的注意事项
 
-1. **预测时必须使用 DataFrame**：如果模型是通过公式创建的，预测时传入的新数据也必须是 DataFrame（或字典），且列名必须与训练时一致
+1. **预测时必须使用 DataFrame**：如果模型是通过公式创建的，预测时传入的新数据也必须是 DataFrame（或字典）
 
-2. **分类变量的一致性**：预测时分类变量可以包含训练时未见过的类别，但这些类别会被编码为全 0 列（取决于编码方式）
+2. **分类变量的一致性**：预测时分类变量可以包含训练时未见过的类别，但这些类别会被编码为全 0 列
 
-3. **公式中的函数**：公式中使用的函数（如 `log()`、`C()`）在预测时也需要可用（在评估环境中）
+3. **求解机制的选择**：
+   - **线性回归**：使用 `method="pinv"`（默认）或 `"qr"`，无需关心迭代
+   - **Logit/Probit**：使用 `method="newton"`（默认），注意检查 `results.mle_retvals["converged"]`
+   - **GLM**：使用 `method="IRLS"`（默认），通常比纯梯度优化更稳定
 
-4. **缺失值处理**：训练时的 `missing="drop"` 策略会在预测时同样应用
-
-5. **截距处理**：公式中的 `-1` 或 `0 +` 会被正确反映在设计矩阵和后续的统计检验中
+4. **迭代模型的起始参数**：Logit/Probit/Poisson 等迭代模型可以通过 `start_params` 提供更好的起始值，帮助收敛
 
 ---
 
 ## 附录：完整调用链示例
 
 ### 示例代码
+
 ```python
 import pandas as pd
 import statsmodels.formula.api as smf
+import statsmodels.api as sm
 
 # 准备数据
 df = pd.DataFrame({
     'price': [250, 300, 350, 400, 450],
     'bedrooms': [2, 3, 3, 4, 4],
     'neighborhood': ['A', 'B', 'A', 'C', 'B'],
-    'sqft': [1000, 1200, 1500, 1800, 2000]
+    'sqft': [1000, 1200, 1500, 1800, 2000],
+    'sold': [0, 1, 0, 1, 1]  # 用于 Logit 示例
 })
 
-# 使用公式建模
-model = smf.ols("price ~ bedrooms + C(neighborhood) + sqft", data=df)
-results = model.fit()
+# ========== 示例 1：OLS（解析解） ==========
+print("=" * 50)
+print("示例 1：OLS（解析解）")
+print("=" * 50)
 
-# 预测
-new_data = pd.DataFrame({
-    'bedrooms': [3],
-    'neighborhood': ['B'],
-    'sqft': [1300]
-})
-prediction = results.predict(new_data)
+model_ols = smf.ols("price ~ bedrooms + C(neighborhood) + sqft", data=df)
+results_ols = model_ols.fit(method="pinv")  # 注意：method 是 "pinv"，不是 "newton"！
+
+print(f"OLS 参数:\n{results_ols.params}")
+print(f"\nOLS method: {results_ols.model}")  # OLS
+# 注意：OLS 没有 mle_retvals（因为没有迭代！）
+
+# ========== 示例 2：Logit（迭代优化） ==========
+print("\n" + "=" * 50)
+print("示例 2：Logit（迭代优化）")
+print("=" * 50)
+
+model_logit = smf.logit("sold ~ bedrooms + sqft", data=df)
+results_logit = model_logit.fit(method="newton")  # 注意：method 是 "newton"！
+
+print(f"Logit 参数:\n{results_logit.params}")
+print(f"\n是否收敛: {results_logit.mle_retvals['converged']}")  # 有收敛信息！
+print(f"迭代次数: {results_logit.mle_retvals['iterations']}")  # 有迭代次数！
 ```
 
-### 调用链追踪
+### 关键差异示例输出
 
 ```
-1. smf.ols(...)
-   │
-   ├──► statsmodels/formula/api.py:14
-   │    ols = lm_.OLS.from_formula
-   │
-   └──► statsmodels/base/model.py:156 (Model.from_formula)
-        │
-        ├──► 处理 subset (None)
-        ├──► eval_env = 2 → 3
-        ├──► missing = "drop" → "raise"（转换）
-        │
-        └──► statsmodels/formula/formulatools.py:15 (handle_formula_data)
-             │
-             ├──► FormulaManager() 初始化
-             ├──► get_na_action(action="drop")
-             │
-             └──► statsmodels/formula/_manager.py:417 (get_matrices)
-                  │
-                  ├──► 判断: "~" 在公式中 → 使用 dmatrices
-                  │
-                  └──► patsy.dmatrices(
-                       formula="price ~ bedrooms + C(neighborhood) + sqft",
-                       data=df,
-                       eval_env=3,
-                       return_type="dataframe",
-                       NA_action=NAAction(...)
-                   )
-                  │
-                  ├──► Patsy 内部处理（解析→评估→编码→组装）
-                  │
-                  └──► 返回 (endog, exog)，两者都是 DataFrame
-                       ├──► endog: 单列 'price'
-                       └──► exog: 包含以下列的 DataFrame:
-                            - Intercept (截距)
-                            - C(neighborhood)[T.B]
-                            - C(neighborhood)[T.C]
-                            - bedrooms
-                            - sqft
-                       └──► exog.design_info: DesignInfo 实例
-                            ├──► .column_names: ['Intercept', 'C(neighborhood)[T.B]', ...]
-                            ├──► .term_names: ['Intercept', 'C(neighborhood)', 'bedrooms', 'sqft']
-                            ├──► .factor_infos: 每个因子的详细信息
-                            └──► .term_codings: 分类变量的对比矩阵
-                  │
-                  └──► get_matrices 保存 self._spec = exog.design_info
-             │
-             └──► handle_formula_data 返回:
-                  ((endog, exog), missing_mask=None, model_spec=DesignInfo)
-        │
-        ├──► 验证 endog 维度 (通过)
-        ├──► 处理 drop_cols (None)
-        │
-        ├──► 更新 kwargs:
-        │    - missing_idx = None
-        │    - missing = "drop"
-        │    - formula = "price ~ bedrooms + C(neighborhood) + sqft"
-        │    - model_spec = DesignInfo
-        │
-        └──► 实例化 OLS:
-             mod = OLS(endog, exog, **kwargs)
-        │
-        ├──► mod.formula = 公式字符串
-        ├──► mod.data.frame = df（原始数据引用）
-        │
-        └──► 返回 model 实例
-│
-└──► model.fit()  # 标准 OLS 拟合，只使用数值矩阵
-     │
-     └──► 返回 RegressionResults 实例
-          │
-          └──► results.model.model_spec = DesignInfo（供预测使用）
-│
-└──► results.predict(new_data)
-     │
-     └──► statsmodels/base/model.py:1209 (Results.predict)
-          │
-          └──► _transform_predict_exog(new_data, transform=True)
-               │
-               ├──► 检查: 模型有 formula 属性 → 是
-               ├──► 获取 model_spec（从 results.model）
-               │
-               └──► FormulaManager().get_matrices(
-                    model_spec,  # 注意：这里传入的是 DesignInfo，不是字符串！
-                    new_data,
-                    pandas=True,
-                    prediction=True
-                )
-               │
-               ├──► Patsy 使用保存的 DesignInfo:
-               │    - C(neighborhood) 使用相同的参考水平 'A'
-               │    - 列顺序与训练时完全一致
-               │    - 不重新解析公式字符串
-               │
-               └──► 返回转换后的 exog:
-                    DataFrame，列顺序: Intercept, C(neighborhood)[T.B], ...
-│
-└──► 最终预测值
+==================================================
+示例 1：OLS（解析解）
+==================================================
+OLS 参数:
+Intercept               -50.0
+C(neighborhood)[T.B]     20.0
+C(neighborhood)[T.C]     40.0
+bedrooms                 10.0
+sqft                      0.2
+dtype: float64
+
+注意：OLS 没有 mle_retvals，因为没有迭代过程！
+
+==================================================
+示例 2：Logit（迭代优化）
+==================================================
+Optimization terminated successfully.
+         Current function value: 0.480
+         Iterations: 6              # 有迭代次数！
+         Function evaluations: 7
+         Gradient evaluations: 7
+
+Logit 参数:
+Intercept   -10.5
+bedrooms      1.2
+sqft          0.01
+dtype: float64
+
+是否收敛: True               # 有收敛信息！
+迭代次数: 6
 ```
+
+### OLS 与 Logit 的 `fit()` 方法参数对比
+
+| 参数 | OLS.fit() | Logit.fit() |
+|------|-----------|-------------|
+| `method` | `"pinv"`, `"qr"` | `"newton"`, `"bfgs"`, `"nm"`, `"lbfgs"`, `"cg"`, `"ncg"`, `"powell"`, `"minimize"` |
+| `start_params` | 不支持 | 支持（默认全 0） |
+| `maxiter` | 不支持 | 支持（默认 35） |
+| `full_output` | 不支持 | 支持 |
+| `disp` | 不支持 | 支持 |
+| `callback` | 不支持 | 支持 |
+
+### 调用链对比
+
+**OLS 调用链**（解析解）：
+```
+smf.ols(formula, data)
+    │
+    ├──► Model.from_formula() → 调用 Patsy → 生成 endog, exog
+    │
+    └──► model.fit(method="pinv")
+            │
+            └──► RegressionModel.fit()
+                    │
+                    ├──► pinv_wexog = pinv(wexog)
+                    ├──► beta = pinv_wexog @ wendog  # ⚠️ 直接计算，无循环！
+                    └──► 返回 RegressionResults
+```
+
+**Logit 调用链**（迭代优化）：
+```
+smf.logit(formula, data)
+    │
+    ├──► Model.from_formula() → 调用 Patsy → 生成 endog, exog
+    │                          （与 OLS 完全相同！）
+    │
+    └──► model.fit(method="newton")
+            │
+            └──► DiscreteModel.fit()
+                    │
+                    └──► super().fit(...)  # 调用 LikelihoodModel.fit()
+                            │
+                            ├──► start_params = [0.0] * k  # 起始参数
+                            │
+                            └──► optimizer._fit(...)  # 迭代优化！
+                                    │
+                                    └──► while not converged:
+                                            ├──► 计算 gradient = score(params)
+                                            ├──► 计算 Hessian = hessian(params)
+                                            └──► 更新 params (Newton 步)
+```
+
+**关键理解**：
+- **公式处理阶段完全相同**：OLS 和 Logit 都通过 `from_formula` 调用 patsy 生成设计矩阵
+- **求解阶段完全不同**：OLS 使用解析解（0 次迭代），Logit 使用迭代优化
+- **Patsy 不参与求解阶段**：设计矩阵生成后，patsy 的工作就结束了
 
 这个示例清楚地展示了：
-1. **训练时**：公式字符串 → DesignInfo + 设计矩阵
-2. **保存时**：DesignInfo 被附加到 model 对象
-3. **预测时**：直接使用 DesignInfo 转换新数据，确保一致性
+1. **训练时**：公式字符串 → Patsy → DesignInfo + 设计矩阵
+2. **求解时**：
+   - OLS：直接矩阵运算，无迭代
+   - Logit：迭代优化，需要检查收敛
+3. **预测时**：直接使用保存的 DesignInfo 转换新数据，确保一致性
