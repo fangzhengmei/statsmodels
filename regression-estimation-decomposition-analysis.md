@@ -1,715 +1,961 @@
-# Statsmodels 回归估计数值分解策略分析报告
+# Statsmodels 回归估计异常路径分析报告
 
-## 1. 整体架构概览
+## 1. 引言
 
-Statsmodels 的线性回归估计系统采用了**分层继承 + 统一接口**的设计模式，确保不同的估计方法能够在相同的框架下协同工作。
-
-### 1.1 类继承体系
-
-```
-base.LikelihoodModel
-    └── RegressionModel (基类，定义统一接口)
-            ├── GLS (广义最小二乘)
-            │       └── GLSAR (带自回归误差的 GLS)
-            └── WLS (加权最小二乘)
-                    └── OLS (普通最小二乘)
-```
-
-### 1.2 核心设计理念
-
-通过以下机制实现接口统一：
-1. **统一入口**：`fit()` 方法定义算法骨架
-2. **策略模式**：`method` 参数选择数值分解策略
-3. **模板方法**：`whiten()` 方法由各子类实现数据预处理
-4. **统一输出**：所有策略产生相同的中间结果格式
+本报告深入分析 statsmodels 回归估计在**异常路径**上的统一接口机制，重点关注：
+1. **秩亏/近奇异矩阵**的检测与处理
+2. **QR 求解失败**的退化处理
+3. **稳健协方差依赖 pinv**的实现细节
+4. **错误/退化信息**的缓存、传递与展示
 
 ---
 
-## 2. 数值分解策略详解
+## 2. 秩亏与近奇异矩阵的检测机制
 
-Statsmodels 支持两种主要的线性回归数值分解策略：**伪逆法 (PINV)** 和 **QR 分解法**。
+### 2.1 核心概念
 
-### 2.1 伪逆法 (Pseudoinverse Method)
+**秩亏矩阵** (Rank-deficient Matrix)：设计矩阵 X 的列之间存在完美线性依赖，导致 `rank(X) < p`（p 为自变量个数）。
 
-**实现位置**：`statsmodels/regression/linear_model.py:349-365`
+**近奇异矩阵** (Near-singular Matrix)：设计矩阵 X 的列之间存在高度线性依赖（多重共线性），虽然数学上满秩，但数值上接近奇异，表现为**条件数很大**。
 
-#### 核心算法逻辑
-
-```python
-if method == "pinv":
-    if not (hasattr(self, "pinv_wexog") and 
-            hasattr(self, "normalized_cov_params") and 
-            hasattr(self, "rank")):
-        
-        # 1. 使用 SVD 计算 Moore-Penrose 伪逆
-        self.pinv_wexog, singular_values = pinv_extended(self.wexog)
-        
-        # 2. 计算归一化协方差参数: pinv(X) @ pinv(X).T
-        self.normalized_cov_params = np.dot(
-            self.pinv_wexog, np.transpose(self.pinv_wexog)
-        )
-        
-        # 3. 缓存奇异值供后续使用
-        self.wexog_singular_values = singular_values
-        
-        # 4. 基于奇异值计算矩阵秩
-        self.rank = np.linalg.matrix_rank(np.diag(singular_values))
-    
-    # 5. 计算回归系数: β = pinv(X) @ y
-    beta = np.dot(self.pinv_wexog, self.wendog)
-```
-
-#### PINV 扩展实现
+### 2.2 PINV 方法的内在鲁棒性
 
 **实现位置**：`statsmodels/tools/tools.py:244-265`
+
+PINV 方法通过 SVD 分解和小奇异值截断，**内在地**处理秩亏和近奇异问题：
 
 ```python
 def pinv_extended(x, rcond=1e-15):
     """
     返回伪逆矩阵以及计算中使用的奇异值
-    代码改编自 NumPy
     """
     x = np.asarray(x)
     x = x.conjugate()
     
-    # SVD 分解: X = U @ diag(S) @ Vt
+    # ========== 步骤 1: SVD 分解 ==========
+    # X = U @ diag(S) @ Vt
     u, s, vt = np.linalg.svd(x, False)
-    s_orig = np.copy(s)
+    s_orig = np.copy(s)  # 保存原始奇异值
     
     m = u.shape[0]
     n = vt.shape[1]
     
-    # 数值稳定性: 截断小奇异值
+    # ========== 步骤 2: 小奇异值截断 (关键!) ==========
+    # cutoff = rcond * max(singular_values)
+    # 默认 rcond = 1e-15
     cutoff = rcond * np.maximum.reduce(s)
+    
     for i in range(min(n, m)):
         if s[i] > cutoff:
-            s[i] = 1./s[i]   # 大奇异值取倒数
+            s[i] = 1./s[i]   # 大奇异值: 正常取倒数
         else:
-            s[i] = 0.         # 小奇异值置零
+            s[i] = 0.         # 小奇异值: 置零 (秩亏处理)
     
-    # 计算伪逆: pinv(X) = Vt.T @ diag(1/S) @ U.T
+    # ========== 步骤 3: 计算伪逆 ==========
+    # pinv(X) = Vt.T @ diag(1/S) @ U.T
     res = np.dot(np.transpose(vt), np.multiply(s[:, np.newaxis],
                                                np.transpose(u)))
+    
+    # 返回伪逆和原始奇异值
     return res, s_orig
 ```
 
-#### 数学原理
+### 2.3 奇异值的缓存机制
 
-最小二乘问题的正规方程：
-```
-X.T @ X @ β = X.T @ y
+**实现位置**：`statsmodels/regression/linear_model.py:349-387`
+
+```python
+if method == "pinv":
+    if not (hasattr(self, "pinv_wexog") and ...):
+        # 计算伪逆和奇异值
+        self.pinv_wexog, singular_values = pinv_extended(self.wexog)
+        
+        # ========== 关键缓存 1: 奇异值 ==========
+        # 用于后续诊断 (条件数、特征值等)
+        self.wexog_singular_values = singular_values
+        
+        # ========== 关键缓存 2: 矩阵秩 ==========
+        # 基于奇异值计算，准确反映数值秩
+        self.rank = np.linalg.matrix_rank(np.diag(singular_values))
+
+elif method == "qr":
+    if not (hasattr(self, "exog_Q") and ...):
+        Q, R = np.linalg.qr(self.wexog)
+        # ...
+        
+        # ========== QR 方法同样缓存奇异值 ==========
+        # 从 R 矩阵计算奇异值 (用于一致性)
+        self.wexog_singular_values = np.linalg.svd(R, 0, 0)
+        
+        # 基于 R 计算秩
+        self.rank = np.linalg.matrix_rank(R)
 ```
 
-当 X 不满秩时，使用 Moore-Penrose 伪逆求解：
-```
-β = pinv(X) @ y
-  = V @ diag(1/s) @ U.T @ y   (通过 SVD 计算)
+### 2.4 诊断信息的计算与传递
+
+#### 特征值计算
+
+**实现位置**：`statsmodels/regression/linear_model.py:2044-2054`
+
+```python
+@cache_readonly
+def eigenvals(self):
+    """
+    返回按降序排列的特征值
+    特征值 = 奇异值²
+    """
+    if self._wexog_singular_values is not None:
+        # 从缓存的奇异值计算
+        eigvals = self._wexog_singular_values**2
+    else:
+        # 后备方案：直接计算
+        wx = self.model.wexog
+        eigvals = np.linalg.eigvalsh(wx.T @ wx)
+    
+    # 按降序排列
+    return np.sort(eigvals)[::-1]
 ```
 
-其中 SVD 分解为：`X = U @ diag(S) @ V.T`
+#### 条件数计算
+
+**实现位置**：`statsmodels/regression/linear_model.py:2056-2067`
+
+```python
+@cache_readonly
+def condition_number(self):
+    """
+    返回外生矩阵的条件数
+    
+    条件数 = sqrt(最大特征值 / 最小特征值)
+           = 最大奇异值 / 最小奇异值
+    
+    解释:
+    - 条件数小 (< 100): 无严重共线性
+    - 条件数中等 (100-1000): 中等共线性
+    - 条件数大 (> 1000): 严重共线性
+    """
+    eigvals = self.eigenvals
+    return np.sqrt(eigvals[0] / eigvals[-1])
+```
+
+#### 奇异值的传递链
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                      奇异值传递链                                          │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  fit() 方法 (模型实例)                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ PINV 方法:                                                           │  │
+│  │   self.pinv_wexog, singular_values = pinv_extended(self.wexog)    │  │
+│  │   self.wexog_singular_values = singular_values  ←── 缓存           │  │
+│  │                                                                      │  │
+│  │ QR 方法:                                                             │  │
+│  │   Q, R = np.linalg.qr(self.wexog)                                   │  │
+│  │   self.wexog_singular_values = np.linalg.svd(R, 0, 0)  ←── 缓存  │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                      │                                      │
+│                                      ▼                                      │
+│  RegressionResults.__init__()                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ # 从模型继承奇异值                                                    │  │
+│  │ if hasattr(model, "wexog_singular_values"):                         │  │
+│  │     self._wexog_singular_values = model.wexog_singular_values      │  │
+│  │ else:                                                                 │  │
+│  │     self._wexog_singular_values = None                              │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                      │                                      │
+│                                      ▼                                      │
+│  结果对象属性 (延迟计算)                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ @cache_readonly                                                       │  │
+│  │ def eigenvals(self):                                                  │  │
+│  │     if self._wexog_singular_values is not None:                      │  │
+│  │         eigvals = self._wexog_singular_values**2                     │  │
+│  │     return np.sort(eigvals)[::-1]                                     │  │
+│  │                                                                      │  │
+│  │ @cache_readonly                                                       │  │
+│  │ def condition_number(self):                                           │  │
+│  │     eigvals = self.eigenvals                                          │  │
+│  │     return np.sqrt(eigvals[0] / eigvals[-1])                         │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.5 诊断信息在汇总输出中的展示
+
+**实现位置**：`statsmodels/regression/linear_model.py:2875-2953`
+
+```python
+def summary(self, yname=None, xname=None, title=None, alpha=0.05, slim=False):
+    # ...
+    
+    # ========== 计算诊断指标 ==========
+    eigvals = self.eigenvals
+    condno = self.condition_number
+    
+    # ========== 缓存诊断信息 ==========
+    self.diagn = dict(
+        jb=jb,                    # Jarque-Bera 正态性检验
+        jbpv=jbpv,                # JB 检验 p 值
+        skew=skew,                # 偏度
+        kurtosis=kurtosis,        # 峰度
+        omni=omni,                # Omnibus 正态性检验
+        omnipv=omnipv,            # Omnibus p 值
+        condno=condno,            # 条件数 ←── 关键诊断
+        mineigval=eigvals[-1],    # 最小特征值 ←── 关键诊断
+    )
+    
+    # ========== 在汇总表中显示 ==========
+    if not slim:
+        diagn_right = [
+            ("Durbin-Watson:", ["%#8.3f" % durbin_watson(self.wresid)]),
+            ("Jarque-Bera (JB):", ["%#8.3f" % jb]),
+            ("Prob(JB):", ["%#8.3g" % jbpv]),
+            ("Cond. No.", ["%#8.3g" % condno]),  # 显示条件数
+        ]
+```
+
+**典型的汇总输出示例**：
+
+```
+                            OLS Regression Results                            
+==============================================================================
+Dep. Variable:                      y   R-squared:                       0.999
+Model:                            OLS   Adj. R-squared:                  0.999
+Method:                 Least Squares   F-statistic:                 1.735e+04
+Date:                Wed, 01 May 2026   Prob (F-statistic):           1.23e-45
+Time:                        10:30:00   Log-Likelihood:                -88.572
+No. Observations:                  50   AIC:                             185.1
+Df Residuals:                      46   BIC:                             192.8
+Df Model:                           3                                         
+Covariance Type:            nonrobust                                         
+==============================================================================
+                 coef    std err          t      P>|t|      [0.025      0.975]
+------------------------------------------------------------------------------
+const          2.3456      0.123     19.070      0.000       2.098       2.593
+x1             0.5678      0.045     12.618      0.000       0.477       0.658
+x2             0.8901      0.234      3.804      0.000       0.419       1.361
+x3             0.1234      0.567      0.218      0.828      -1.019       1.266
+==============================================================================
+Omnibus:                        1.234   Durbin-Watson:                   2.012
+Prob(Omnibus):                  0.540   Jarque-Bera (JB):                1.345
+Skew:                           0.234   Prob(JB):                        0.510
+Kurtosis:                       2.567   Cond. No.                     1.23e+04  ←── 条件数!
+==============================================================================
+
+Notes:
+[1] Standard Errors assume that the covariance matrix of the errors is correctly specified.
+[2] The condition number is large, 1.23e+04. This might indicate that there are
+strong multicollinearity or other numerical problems.  ←── 自动警告!
+```
 
 ---
 
-### 2.2 QR 分解法 (QR Factorization Method)
+## 3. QR 求解失败的退化处理
+
+### 3.1 线性模型 fit() 中的 QR 路径
 
 **实现位置**：`statsmodels/regression/linear_model.py:367-388`
 
-#### 核心算法逻辑
-
 ```python
 elif method == "qr":
-    if not (hasattr(self, "exog_Q") and 
-            hasattr(self, "exog_R") and 
-            hasattr(self, "normalized_cov_params") and 
-            hasattr(self, "rank")):
-        
-        # 1. QR 分解: X = Q @ R
+    if not (hasattr(self, "exog_Q") and hasattr(self, "exog_R") and ...):
         Q, R = np.linalg.qr(self.wexog)
         self.exog_Q, self.exog_R = Q, R
-        
-        # 2. 计算归一化协方差参数: inv(R.T @ R)
         self.normalized_cov_params = np.linalg.inv(np.dot(R.T, R))
-        
-        # 3. 从 R 计算奇异值 (用于诊断)
         self.wexog_singular_values = np.linalg.svd(R, 0, 0)
-        
-        # 4. 基于 R 计算矩阵秩
         self.rank = np.linalg.matrix_rank(R)
     else:
         Q, R = self.exog_Q, self.exog_R
     
-    # 关键处理 1: 仍然计算 pinv 用于某些协方差估计器
-    # 见 GH #8157 - 某些协方差估计器需要 pinv
+    # ========== 潜在风险点 ==========
+    # np.linalg.solve 要求 R 是非奇异的
+    # 如果 R 奇异，会抛出 np.linalg.LinAlgError
+    
+    self.pinv_wexog = np.linalg.pinv(self.wexog)  # 兼容处理
+    self.effects = effects = np.dot(Q.T, self.wendog)
+    beta = np.linalg.solve(R, effects)  # ←── 可能失败!
+```
+
+### 3.2 异常处理模式：yule_walker 示例
+
+**实现位置**：`statsmodels/regression/linear_model.py:1575-1584`
+
+虽然 `fit()` 方法中的 QR 路径没有显式的 try-except，但 statsmodels 在其他地方展示了**标准的异常处理模式**：
+
+```python
+def yule_walker(x, order=1, method="adjusted", df=None, inv=False, demean=True):
+    # ... 计算自相关矩阵 R ...
+    
+    R = toeplitz(r[:-1])  # Yule-Walker 方程的系数矩阵
+    
+    try:
+        # 尝试直接求解
+        rho = np.linalg.solve(R, r[1:])
+    except np.linalg.LinAlgError as err:
+        # ========== 异常处理策略 ==========
+        if "Singular matrix" in str(err):
+            # 1. 发出警告 (非致命)
+            warnings.warn(
+                "Matrix is singular. Using pinv.", 
+                SingularMatrixWarning, 
+                stacklevel=2
+            )
+            # 2. 回退到伪逆方法 (退化但可用)
+            rho = np.linalg.pinv(R) @ r[1:]
+        else:
+            # 其他类型错误重新抛出
+            raise
+```
+
+### 3.3 QR 方法的兼容设计
+
+虽然 `fit()` 中的 QR 路径没有显式的异常处理，但它有两个重要的**兼容设计**：
+
+#### 设计 1：强制计算 pinv_wexog
+
+```python
+elif method == "qr":
+    # ... QR 分解 ...
+    
+    # ========== 关键兼容设计 ==========
+    # Needed for some covariance estimators, see GH #8157
     self.pinv_wexog = np.linalg.pinv(self.wexog)
     
-    # 关键处理 2: 存储 effects 用于 ANOVA 分析
-    self.effects = effects = np.dot(Q.T, self.wendog)
-    
-    # 5. 解三角系统: R @ β = Q.T @ y
-    beta = np.linalg.solve(R, effects)
+    # ... 继续计算 ...
 ```
+
+**为什么重要**：
+- 稳健协方差估计（HC0-HC3）依赖 `pinv_wexog`
+- 即使使用 QR 方法，也必须计算伪逆
+- 这为后续的退化处理提供了基础
+
+#### 设计 2：秩的显式计算
+
+```python
+elif method == "qr":
+    # ...
+    self.rank = np.linalg.matrix_rank(R)
+    # ...
+```
+
+**为什么重要**：
+- `np.linalg.matrix_rank()` 有内置的数值容忍度
+- 它能检测到"数值上秩亏"的矩阵
+- 这个秩值会传递给结果对象，影响自由度计算
+
+### 3.4 潜在的改进空间
+
+当前实现的潜在问题：
+
+```python
+# 当前 QR 路径
+beta = np.linalg.solve(R, effects)  # 可能抛出 LinAlgError
+
+# 更健壮的实现应该是:
+try:
+    beta = np.linalg.solve(R, effects)
+except np.linalg.LinAlgError:
+    warnings.warn(
+        "QR solve failed, falling back to pinv.",
+        SingularMatrixWarning,
+        stacklevel=2
+    )
+    beta = np.dot(self.pinv_wexog, self.wendog)  # 使用已计算的 pinv
+```
+
+---
+
+## 4. 稳健协方差对 pinv 的依赖机制
+
+### 4.1 问题背景：GH #8157
+
+在 `fit()` 方法的 QR 路径中有一行关键注释：
+
+```python
+# Needed for some covariance estimators, see GH #8157
+self.pinv_wexog = np.linalg.pinv(self.wexog)
+```
+
+这揭示了一个重要的**设计约束**：即使选择 QR 方法，某些协方差估计器仍然依赖伪逆。
+
+### 4.2 HCCM 方法的实现
+
+**实现位置**：`statsmodels/regression/linear_model.py:2069-2115`
+
+#### 核心 HCCM 计算函数
+
+```python
+def _HCCM(self, scale):
+    """
+    异方差一致协方差矩阵 (Heteroskedasticity-Consistent Covariance Matrix)
+    
+    公式: cov(β) = pinv(X) @ diag(scale) @ pinv(X).T
+    
+    其中 scale 是残差的某种变换 (不同 HC 类型有不同的 scale)
+    """
+    H = np.dot(self.model.pinv_wexog, scale[:, None] * self.model.pinv_wexog.T)
+    return H
+```
+
+#### HC0-HC3 的具体实现
+
+```python
+@cache_readonly
+def cov_HC0(self):
+    """
+    White (1980) 异方差稳健协方差
+    scale = resid²
+    """
+    self.het_scale = self.wresid**2
+    cov_HC0 = self._HCCM(self.het_scale)  # 调用 _HCCM，使用 pinv_wexog
+    return cov_HC0
+
+@cache_readonly
+def cov_HC1(self):
+    """
+    MacKinnon-White (1985) 调整
+    scale = (n/(n-p)) * resid²
+    """
+    self.het_scale = self.nobs / (self.df_resid) * (self.wresid**2)
+    cov_HC1 = self._HCCM(self.het_scale)
+    return cov_HC1
+
+@cache_readonly
+def cov_HC2(self):
+    """
+    杠杆调整 (Leverage adjustment)
+    scale = resid² / (1 - h_ii)
+    其中 h_ii 是帽子矩阵的对角元
+    """
+    wexog = self.model.wexog
+    # 计算 h_ii = diag(X @ (X'X)^-1 @ X')
+    h = self._abat_diagonal(wexog, self.normalized_cov_params)
+    self.het_scale = self.wresid**2 / (1 - h)
+    cov_HC2 = self._HCCM(self.het_scale)  # 仍然使用 pinv_wexog!
+    return cov_HC2
+
+@cache_readonly
+def cov_HC3(self):
+    """
+    残差删除 (Residual deletion)
+    scale = (resid / (1 - h_ii))²
+    更保守的估计
+    """
+    wexog = self.model.wexog
+    h = self._abat_diagonal(wexog, self.normalized_cov_params)
+    self.het_scale = (self.wresid / (1 - h)) ** 2
+    cov_HC3 = self._HCCM(self.het_scale)
+    return cov_HC3
+```
+
+### 4.3 为什么稳健协方差依赖 pinv？
 
 #### 数学原理
 
-QR 分解将设计矩阵分解为正交矩阵 Q 和上三角矩阵 R：
+标准协方差矩阵：
 ```
-X = Q @ R
-```
-
-最小二乘问题转化为：
-```
-min ||y - Xβ||² = min ||y - Q R β||²
-                = min ||Q.T y - R β||²  (Q 正交保持范数)
+cov(β) = σ² * (X'X)^-1
 ```
 
-由于 R 是上三角矩阵，可以通过回代法高效求解：
+稳健协方差矩阵（三明治估计）：
 ```
-R @ β = Q.T @ y  →  直接回代求解
+cov_robust(β) = (X'X)^-1 @ X' @ Ω @ X @ (X'X)^-1
+
+其中 Ω 是异方差形式的对角矩阵
 ```
+
+使用伪逆的形式：
+```
+cov_pinv(β) = pinv(X) @ Ω @ pinv(X).T
+```
+
+**等价性**：当 X 满秩时，`pinv(X) = (X'X)^-1 @ X'`，所以两种形式等价。
+
+#### 为什么不使用 normalized_cov_params？
+
+`normalized_cov_params` 存储的是 `(X'X)^-1` 或其等价形式，但 HCCM 公式需要：
+
+```python
+# 使用 pinv 的形式 (更通用)
+H = pinv(X) @ diag(scale) @ pinv(X).T
+
+# 等价形式 (需要更多计算)
+H = (X'X)^-1 @ X' @ diag(scale) @ X @ (X'X)^-1
+```
+
+使用 `pinv_wexog` 的优势：
+1. **更简洁**：一次矩阵乘法即可完成
+2. **更通用**：即使 X 秩亏也能工作
+3. **更高效**：伪逆已经缓存，无需重新计算
+
+### 4.4 依赖链完整分析
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                   稳健协方差对 pinv 的依赖链                               │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  用户调用: results = model.fit(cov_type="HC0")                            │
+│                              │                                              │
+│                              ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ fit() 方法内部                                                        │  │
+│  │ ┌─────────────────────────────────────────────────────────────────┐ │  │
+│  │ │ 无论 method 是 "pinv" 还是 "qr":                                │ │  │
+│  │ │                                                                  │ │  │
+│  │ │ PINV 路径:                                                       │ │  │
+│  │ │   self.pinv_wexog = pinv_extended(self.wexog)[0]  ←── 计算   │ │  │
+│  │ │                                                                  │ │  │
+│  │ │ QR 路径:                                                         │ │  │
+│  │ │   Q, R = np.linalg.qr(self.wexog)                               │ │  │
+│  │ │   # ...                                                          │ │  │
+│  │ │   self.pinv_wexog = np.linalg.pinv(self.wexog)  ←── 强制计算!  │ │  │
+│  │ │   # 注释: Needed for some covariance estimators, see GH #8157   │ │  │
+│  │ └─────────────────────────────────────────────────────────────────┘ │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                              │                                              │
+│                              ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ RegressionResults.__init__()                                         │  │
+│  │ ┌─────────────────────────────────────────────────────────────────┐ │  │
+│  │ │ if cov_type != "nonrobust":                                      │ │  │
+│  │ │     self.get_robustcov_results(                                   │ │  │
+│  │ │         cov_type=cov_type, use_self=True, ...                    │ │  │
+│  │ │     )                                                             │ │  │
+│  │ └─────────────────────────────────────────────────────────────────┘ │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                              │                                              │
+│                              ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ 访问稳健协方差 (例如 results.cov_HC0 或 results.bse)                 │  │
+│  │ ┌─────────────────────────────────────────────────────────────────┐ │  │
+│  │ │ @cache_readonly                                                  │ │  │
+│  │ │ def cov_HC0(self):                                               │ │  │
+│  │ │     self.het_scale = self.wresid**2                             │ │  │
+│  │ │     cov_HC0 = self._HCCM(self.het_scale)                        │ │  │
+│  │ │     return cov_HC0                                               │ │  │
+│  │ └─────────────────────────────────────────────────────────────────┘ │  │
+│  │                              │                                       │  │
+│  │                              ▼                                       │  │
+│  │ ┌─────────────────────────────────────────────────────────────────┐ │  │
+│  │ │ def _HCCM(self, scale):                                          │ │  │
+│  │ │     # 关键: 依赖 self.model.pinv_wexog                           │ │  │
+│  │ │     H = np.dot(self.model.pinv_wexog,                            │ │  │
+│  │ │              scale[:, None] * self.model.pinv_wexog.T)           │ │  │
+│  │ │     return H                                                      │ │  │
+│  │ └─────────────────────────────────────────────────────────────────┘ │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.5 如果没有 pinv_wexog 会怎样？
+
+假设 QR 方法中没有这行代码：
+
+```python
+# 假设这行被删除
+# self.pinv_wexog = np.linalg.pinv(self.wexog)
+```
+
+那么当用户尝试使用稳健协方差时：
+
+```python
+model = sm.OLS(y, X).fit(method="qr")
+print(model.cov_HC0)  # 会发生什么?
+```
+
+**答案**：会抛出 `AttributeError`，因为 `self.model.pinv_wexog` 不存在。
+
+这就是为什么 GH #8157 修复强制要求 QR 方法也计算 `pinv_wexog`。
 
 ---
 
-## 3. 统一接口机制详解
+## 5. 异常信息的完整传递路径
 
-### 3.1 fit() 方法：统一入口
+### 5.1 警告类型体系
 
-**实现位置**：`statsmodels/regression/linear_model.py:284-415`
-
-所有回归模型共享同一个 `fit()` 方法，通过 `method` 参数选择不同的数值分解策略：
+**实现位置**：`statsmodels/tools/sm_exceptions.py:148-151`
 
 ```python
-def fit(
-    self,
-    method: Literal["pinv", "qr"] = "pinv",      # 数值分解策略选择
-    cov_type: Literal["nonrobust", "HC0", "HC1", "HC2", "HC3", 
-                       "HAC", "hac-panel", "hac-groupsum", "cluster"] = "nonrobust",
-    cov_kwds=None,
-    use_t: bool | None = None,
-    **kwargs,
-) -> RegressionResults:
+class SingularMatrixWarning(ModelWarning):
     """
-    完整的模型拟合
-    
-    参数
-    ----------
-    method : str, 可选
-        可以是 "pinv" 或 "qr"。
-        "pinv": 使用 Moore-Penrose 伪逆求解最小二乘问题
-        "qr": 使用 QR 分解
-    cov_type : str, 可选
-        协方差估计器类型
-    ...
+    非致命的矩阵求逆问题，会影响输出结果
     """
-    # ========== 阶段 1: 数值分解 (策略选择) ==========
-    if method == "pinv":
-        # PINV 策略实现
-        self.pinv_wexog, singular_values = pinv_extended(self.wexog)
-        self.normalized_cov_params = np.dot(self.pinv_wexog, self.pinv_wexog.T)
-        self.rank = np.linalg.matrix_rank(np.diag(singular_values))
-        beta = np.dot(self.pinv_wexog, self.wendog)
-        
-    elif method == "qr":
-        # QR 策略实现
-        Q, R = np.linalg.qr(self.wexog)
-        self.exog_Q, self.exog_R = Q, R
-        self.normalized_cov_params = np.linalg.inv(np.dot(R.T, R))
-        self.rank = np.linalg.matrix_rank(R)
-        # 解三角系统
-        effects = np.dot(Q.T, self.wendog)
-        beta = np.linalg.solve(R, effects)
-        # 兼容处理: 仍然计算 pinv
-        self.pinv_wexog = np.linalg.pinv(self.wexog)
-        
-    else:
-        raise ValueError('method has to be "pinv" or "qr"')
-    
-    # ========== 阶段 2: 统一自由度计算 ==========
-    if self._df_model is None:
-        self._df_model = float(self.rank - self.k_constant)
-    if self._df_resid is None:
-        self.df_resid = self.nobs - self.rank
-    
-    # ========== 阶段 3: 统一结果对象创建 ==========
-    if isinstance(self, OLS):
-        # OLS 专用结果对象
-        lfit = OLSResults(
-            self,
-            beta,
-            normalized_cov_params=self.normalized_cov_params,
-            cov_type=cov_type,
-            cov_kwds=cov_kwds,
-            use_t=use_t,
+```
+
+**警告继承体系**：
+```
+Warning
+└── UserWarning
+    └── ModelWarning (基础内部警告类)
+        ├── SingularMatrixWarning  ←── 矩阵奇异警告
+        ├── ConvergenceWarning
+        ├── CollinearityWarning
+        └── ...
+```
+
+### 5.2 实际触发警告的场景
+
+#### 场景 1：Yule-Walker 方程求解
+
+```python
+try:
+    rho = np.linalg.solve(R, r[1:])
+except np.linalg.LinAlgError as err:
+    if "Singular matrix" in str(err):
+        warnings.warn(
+            "Matrix is singular. Using pinv.", 
+            SingularMatrixWarning, 
+            stacklevel=2
         )
-    else:
-        # 通用结果对象
-        lfit = RegressionResults(
-            self,
-            beta,
-            normalized_cov_params=self.normalized_cov_params,
-            cov_type=cov_type,
-            cov_kwds=cov_kwds,
-            use_t=use_t,
-            **kwargs,
-        )
-    
-    # 包装结果对象，提供更友好的 API
-    return RegressionResultsWrapper(lfit)
+        rho = np.linalg.pinv(R) @ r[1:]
 ```
 
-### 3.2 数据预处理的统一流程
+#### 场景 2：混合线性模型中的协方差奇异
 
-**实现位置**：`statsmodels/regression/linear_model.py:225-234`
-
-无论使用哪种分解方法，数据都经过相同的预处理流程：
+**实现位置**：`statsmodels/regression/mixed_linear_model.py:1285-1289`
 
 ```python
-class RegressionModel(base.LikelihoodModel):
-    def __init__(self, endog, exog, **kwargs):
-        super().__init__(endog, exog, **kwargs)
-        self.pinv_wexog: Float64Array | None = None
-        # 注册数据属性，用于数据处理
-        self._data_attr.extend(["pinv_wexog", "wendog", "wexog", "weights"])
-
-    def initialize(self):
-        """初始化模型组件 - 所有模型共享"""
-        # 1. 白化（whiten）设计矩阵 - 各模型自行实现
-        self.wexog = self.whiten(self.exog)
-        self.wendog = self.whiten(self.endog)
-        
-        # 2. 统一计算样本量
-        self.nobs = float(self.wexog.shape[0])
-        
-        # 3. 初始化自由度和秩
-        self._df_model = None
-        self._df_resid = None
-        self.rank = None
+# 检查协方差矩阵是否奇异
+if np.linalg.cond(cov) > 1e10:  # 条件数过大
+    warnings.warn(
+        _warn_cov_sing,  # "The covariance matrix of the random effects..."
+        SingularMatrixWarning, 
+        stacklevel=2
+    )
 ```
 
-### 3.3 白化方法的策略差异
+#### 场景 3：广义估计方程中的奇异
 
-`whiten()` 方法是**模板方法模式**的典型应用，基类定义接口，子类实现具体变换：
-
-| 模型 | whiten 方法实现 | 变换目的 | 代码位置 |
-|------|----------------|----------|----------|
-| **OLS** | `return x` | 无需变换 | `linear_model.py:1036-1054` |
-| **WLS** | `x * sqrt(weights)` | 处理异方差 | `linear_model.py:815-834` |
-| **GLS** | `cholsigmainv @ x` | 处理一般协方差结构 | `linear_model.py:587-614` |
-| **GLSAR** | 减去自回归项 | 处理自相关误差 | `linear_model.py:1456-1479` |
-
-#### OLS 白化实现
+**实现位置**：`statsmodels/genmod/generalized_estimating_equations.py:1525-1528`
 
 ```python
-def whiten(self, x):
-    """OLS model whitener does nothing."""
-    return x
+try:
+    # 某些矩阵运算
+except np.linalg.LinAlgError:
+    msg = ("The working covariance matrix is singular. "
+           "This may indicate that the model is not appropriate "
+           "for the data.")
+    warnings.warn(msg, SingularMatrixWarning, stacklevel=2)
 ```
 
-#### WLS 白化实现
+### 5.3 诊断信息的多层访问
+
+#### 层 1：直接访问属性
 
 ```python
-def whiten(self, x):
-    """Whitener for WLS model, multiplies each column by sqrt(self.weights)."""
-    x = np.asarray(x)
-    if x.ndim == 1:
-        return x * np.sqrt(self.weights)
-    elif x.ndim == 2:
-        return np.sqrt(self.weights)[:, None] * x
+results = model.fit()
+
+# 数值诊断
+print(f"条件数: {results.condition_number}")
+print(f"特征值: {results.eigenvals}")
+print(f"矩阵秩: {results.rank}")
+print(f"样本量: {results.nobs}")
+print(f"模型自由度: {results.df_model}")
+print(f"残差自由度: {results.df_resid}")
 ```
 
-#### GLS 白化实现
+#### 层 2：诊断字典
 
 ```python
-def whiten(self, x):
-    """GLS whiten method - 使用 Cholesky 逆变换"""
-    x = np.asarray(x)
-    if self.sigma is None or self.sigma.shape == ():
-        return x
-    elif self.sigma.ndim == 1:
-        # 对角协方差 (等价于 WLS)
-        if x.ndim == 1:
-            return x * self.cholsigmainv
-        else:
-            return x * self.cholsigmainv[:, None]
-    else:
-        # 一般协方差矩阵
-        return np.dot(self.cholsigmainv, x)
+# 在 summary() 调用后填充
+results.summary()
+
+print(results.diagn)
+# 输出:
+# {
+#     'jb': 1.234,           # Jarque-Bera 统计量
+#     'jbpv': 0.54,          # JB p 值
+#     'skew': 0.234,         # 偏度
+#     'kurtosis': 2.567,     # 峰度
+#     'omni': 1.234,         # Omnibus 统计量
+#     'omnipv': 0.54,        # Omnibus p 值
+#     'condno': 12345.6,     # 条件数 ←── 关键
+#     'mineigval': 0.00123,  # 最小特征值 ←── 关键
+# }
 ```
+
+#### 层 3：汇总输出
+
+```python
+print(results.summary())
+# 包含:
+# - 条件数显示
+# - 如果条件数过大，自动添加警告注释
+```
+
+### 5.4 条件数阈值与解释
+
+| 条件数范围 | 解释 | 建议行动 |
+|-----------|------|----------|
+| < 100 | 无严重共线性 | 无需特殊处理 |
+| 100 - 1000 | 中等共线性 | 检查变量相关性，考虑 PCA |
+| 1000 - 10000 | 较强共线性 | 可能影响系数稳定性 |
+| > 10000 | 严重共线性 | 强烈建议检查模型设定 |
+
+**注意**：这些阈值是经验法则，具体问题需要具体分析。
 
 ---
 
-## 4. 结果对象的统一生成
+## 6. 异常路径的统一接口设计总结
 
-### 4.1 结果类继承体系
+### 6.1 设计原则
+
+#### 原则 1：优雅退化而非崩溃
 
 ```
-base.LikelihoodModelResults
-    └── RegressionResults (通用回归结果)
-            └── OLSResults (OLS 专用结果，增加特定功能)
+设计目标:
+┌─────────────────────────────────────────────────────────────────┐
+│  错误类型              当前行为              理想行为             │
+├─────────────────────────────────────────────────────────────────┤
+│  秩亏矩阵              PINV: 自动处理        保持                 │
+│                        QR: 可能崩溃          退化到 PINV         │
+│                                                                   │
+│  近奇异矩阵            PINV: 截断小奇异值    保持                 │
+│                        QR: 可能不准确        提供警告             │
+│                                                                   │
+│  稳健协方差请求        强制计算 pinv        保持                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 结果对象初始化
+#### 原则 2：诊断信息可访问
 
-**实现位置**：`statsmodels/regression/linear_model.py:1659-1757`
+无论估计是否完全"成功"，用户都应该能够访问：
+- 数值诊断（条件数、特征值、秩）
+- 统计诊断（正态性检验、自相关检验）
+- 警告信息（通过 Python warnings 机制）
+
+#### 原则 3：接口一致性
+
+- `fit(method="pinv")` 和 `fit(method="qr")` 返回**相同类型**的结果对象
+- 结果对象具有**相同的属性和方法**
+- 即使内部使用不同的数值方法，外部接口保持一致
+
+### 6.2 统一接口的实现保障
+
+#### 保障 1：缓存机制
 
 ```python
-class RegressionResults(base.LikelihoodModelResults):
-    """
-    汇总线性回归模型的拟合结果
-    处理对比检验、协方差估计等
-    """
-    
-    def __init__(
-        self,
-        model,                    # 模型实例
-        params,                   # 估计的系数 β
-        normalized_cov_params,   # 归一化协方差矩阵
-        scale=1.0,               # 残差尺度
-        cov_type="nonrobust",    # 协方差类型
-        cov_kwds=None,           # 协方差额外参数
-        use_t=None,              # 是否使用 t 分布
-        **kwargs,
-    ):
-        # 调用父类初始化
-        super().__init__(model, params, normalized_cov_params, scale)
-        
-        self._cache = {}
-        
-        # 继承模型的奇异值 (用于诊断)
-        if hasattr(model, "wexog_singular_values"):
-            self._wexog_singular_values = model.wexog_singular_values
-        else:
-            self._wexog_singular_values = None
-        
-        # 继承模型的自由度
-        self.df_model = model.df_model
-        self.df_resid = model.df_resid
-        
-        # ========== 协方差类型处理 ==========
-        if cov_type == "nonrobust":
-            # 标准协方差: cov(β) = scale * normalized_cov_params
-            self.cov_type = "nonrobust"
-            self.cov_kwds = {
-                "description": "Standard Errors assume that the covariance matrix of "
-                               "the errors is correctly specified."
-            }
-            if use_t is None:
-                use_t = True  # 默认使用 t 分布
-            self.use_t = use_t
-        else:
-            # 稳健协方差: 调用专门的估计方法
-            if cov_kwds is None:
-                cov_kwds = {}
-            if "use_t" in cov_kwds:
-                use_t_2 = cov_kwds.pop("use_t")
-                if use_t is None:
-                    use_t = use_t_2
-            
-            # 调用稳健协方差估计方法
-            self.get_robustcov_results(
-                cov_type=cov_type, use_self=True, use_t=use_t, **cov_kwds
-            )
-        
-        # 处理额外参数
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+# 模型实例中的缓存
+self.pinv_wexog           # 伪逆矩阵 (所有方法最终都有)
+self.wexog_singular_values # 奇异值 (所有方法最终都有)
+self.normalized_cov_params # 归一化协方差 (所有方法最终都有)
+self.rank                  # 矩阵秩 (所有方法最终都有)
+
+# 结果对象中的缓存
+self._wexog_singular_values # 继承的奇异值
+self.eigenvals               # 延迟计算的特征值
+self.condition_number        # 延迟计算的条件数
+self.diagn                   # 汇总后的诊断字典
 ```
 
-### 4.3 协方差矩阵的统一计算
+#### 保障 2：兼容计算
 
-无论使用哪种分解方法，协方差矩阵的计算遵循统一的逻辑：
-
-#### 基本公式
-
-```
-cov(β) = scale * normalized_cov_params
-
-其中：
-- scale = SSR / df_resid  (残差均方)
-- normalized_cov_params:
-  * PINV 方法: pinv(X) @ pinv(X).T
-  * QR 方法: inv(R.T @ R)
-```
-
-#### 稳健协方差的统一接口
-
-`get_robustcov_results()` 方法支持多种协方差类型：
-
-| cov_type | 方法名称 | 适用场景 |
-|----------|----------|----------|
-| `nonrobust` | 标准 OLS 协方差 | 同方差、无自相关 |
-| `HC0` | White 稳健协方差 | 存在异方差 |
-| `HC1` | MacKinnon-White 调整 | 异方差 + 小样本校正 |
-| `HC2` | 杠杆调整稳健协方差 | 异方差 + 高杠杆点 |
-| `HC3` | 残差删除稳健协方差 | 异方差 (最保守) |
-| `HAC` | Newey-West 协方差 | 异方差 + 自相关 |
-| `cluster` | 聚类稳健标准误 | 面板数据/聚类结构 |
-| `hac-panel` | 面板 HAC | 面板数据 |
-| `hac-groupsum` | Driscoll-Kraay | 面板数据 (大 N 大 T) |
-
----
-
-## 5. 两种分解策略的对比分析
-
-### 5.1 数学等价性
-
-从数学上讲，当设计矩阵 X 满秩时，两种方法应该得到相同的结果：
-
-**PINV 方法**：
-```
-β_pinv = pinv(X) @ y
-      = (X.T @ X)^-1 @ X.T @ y  (当 X 满秩时)
-```
-
-**QR 方法**：
-```
-X = Q @ R  (Q 正交, R 上三角)
-
-由于 Q 正交:
-X.T @ X = R.T @ Q.T @ Q @ R = R.T @ R
-X.T @ y = R.T @ Q.T @ y
-
-所以:
-β_qr = solve(R, Q.T @ y) 
-     = inv(R.T @ R) @ X.T @ y 
-     = (X.T @ X)^-1 @ X.T @ y
-```
-
-**结论**：满秩时，`β_pinv = β_qr`
-
-### 5.2 数值稳定性对比
-
-| 特性 | PINV (SVD 基) | QR 分解 |
-|------|---------------|---------|
-| **奇异值处理** | 显式截断小奇异值 (`rcond` 参数控制) | 依赖 `np.linalg.solve` 的精度 |
-| **秩检测** | 基于奇异值，更准确可靠 | 基于 R 的对角元大小 |
-| **计算复杂度** | O(n×p²) | O(n×p²) |
-| **内存使用** | 需要存储 U, S, Vt | 需要存储 Q, R |
-| **数值稳定性** | 对多重共线性更稳定 | 对接近奇异矩阵可能有问题 |
-| **默认选择** | ✅ statsmodels 默认 | 可选方法 |
-
-### 5.3 代码中的差异处理
+QR 方法中的关键兼容设计：
 
 ```python
-# QR 方法的额外兼容处理
-if method == "qr":
+elif method == "qr":
     # ... QR 分解 ...
     
-    # === 差异 1: 仍然计算 pinv ===
-    # 见 GH #8157 - 某些协方差估计器需要 pinv
+    # 保障 1: 强制计算 pinv_wexog
     self.pinv_wexog = np.linalg.pinv(self.wexog)
     
-    # === 差异 2: 存储 effects ===
-    # effects = Q.T @ y，用于 ANOVA 分析
-    self.effects = effects = np.dot(Q.T, self.wendog)
+    # 保障 2: 计算奇异值 (与 PINV 方法一致)
+    self.wexog_singular_values = np.linalg.svd(R, 0, 0)
+    
+    # 保障 3: 计算秩
+    self.rank = np.linalg.matrix_rank(R)
 ```
 
-### 5.4 选择建议
-
-**使用 PINV (默认) 的场景**：
-- 存在多重共线性风险
-- 需要准确的秩检测
-- 对数值稳定性要求高
-
-**使用 QR 的场景**：
-- 设计矩阵满秩或接近满秩
-- 需要进行 ANOVA 分析
-- 追求微小的计算效率优势
-
----
-
-## 6. 完整估计流程图
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                      用户调用: model.fit(method="pinv/qr")                 │
-└──────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│  阶段 1: 模型初始化 (所有模型共享流程)                                      │
-│  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │ 1. 调用 model.initialize()                                          │  │
-│  │    - wexog = whiten(exog)  [各模型自定义实现]                        │  │
-│  │    - wendog = whiten(endog) [各模型自定义实现]                       │  │
-│  │    - 更新 nobs, 初始化 df_model, df_resid, rank                     │  │
-│  └────────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│  阶段 2: 数值分解 (根据 method 分支)                                       │
-│                                                                             │
-│  ┌──────────────────────┐              ┌──────────────────────┐          │
-│  │   method == "pinv"   │              │    method == "qr"    │          │
-│  └──────────────────────┘              └──────────────────────┘          │
-│           │                                        │                       │
-│           ▼                                        ▼                       │
-│  ┌─────────────────────────┐       ┌─────────────────────────┐          │
-│  │ pinv_extended(wexog)    │       │ np.linalg.qr(wexog)    │          │
-│  │ - SVD 分解: X=U@S@Vt    │       │ - QR 分解: X=Q@R        │          │
-│  │ - 截断小奇异值          │       │ - Q 正交, R 上三角      │          │
-│  │ - 返回 pinv + 奇异值    │       │ - 从 R 计算奇异值       │          │
-│  └─────────────────────────┘       └─────────────────────────┘          │
-│           │                                        │                       │
-│           ▼                                        ▼                       │
-│  ┌─────────────────────────┐       ┌─────────────────────────┐          │
-│  │ β = pinv @ wendog       │       │ effects = Q.T @ wendog  │          │
-│  │                         │       │ β = solve(R, effects)   │          │
-│  └─────────────────────────┘       └─────────────────────────┘          │
-│           │                                        │                       │
-│           └────────────────────┬───────────────────┘                       │
-│                                ▼                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │ 统一输出中间结果:                                                    │   │
-│  │ - β: 回归系数 (完全相同)                                             │   │
-│  │ - normalized_cov_params: 归一化协方差 (数学等价)                     │   │
-│  │ - rank: 矩阵秩                                                        │   │
-│  │ - wexog_singular_values: 奇异值 (用于诊断)                           │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│  阶段 3: 结果对象创建 (统一接口)                                           │
-│  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │ 1. 计算自由度: df_model = rank - k_constant                         │  │
-│  │                        df_resid = nobs - rank                        │  │
-│  │                                                                         │  │
-│  │ 2. 创建结果对象:                                                        │  │
-│  │    - OLS 模型 → OLSResults (OLS 专用)                                 │  │
-│  │    - 其他模型 → RegressionResults (通用)                              │  │
-│  │                                                                         │  │
-│  │ 3. 处理协方差类型:                                                      │  │
-│  │    - nonrobust: 使用 normalized_cov_params                           │  │
-│  │    - 其他: 调用 get_robustcov_results() 计算稳健协方差                │  │
-│  │                                                                         │  │
-│  │ 4. 包装结果: RegressionResultsWrapper (提供友好 API)                  │  │
-│  └────────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│                      返回: RegressionResultsWrapper                        │
-│  包含属性:                                                                  │
-│  - params: 系数估计                                                        │
-│  - bse: 标准误 (sqrt(diag(cov_params())))                                  │
-│  - tvalues / pvalues: 推断统计量                                           │
-│  - rsquared / rsquared_adj: 拟合优度                                       │
-│  - resid / fittedvalues: 残差/拟合值                                       │
-│  - scale / ssr / ess: 方差分解                                             │
-│  - df_model / df_resid: 自由度                                             │
-│  - cov_type / cov_kwds: 协方差信息                                         │
-│                                                                             │
-│  包含方法:                                                                  │
-│  - summary(): 生成汇总输出                                                  │
-│  - predict(): 预测                                                          │
-│  - t_test() / f_test(): 假设检验                                           │
-│  - conf_int(): 置信区间                                                     │
-│  - get_prediction(): 预测区间                                               │
-│  - get_robustcov_results(): 切换协方差类型                                 │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 7. 关键设计模式总结
-
-### 7.1 模板方法模式 (Template Method)
-
-`RegressionModel.fit()` 定义了算法的骨架，将具体的数值分解步骤延迟到方法参数控制：
-
-```
-fit() 方法骨架:
-┌─────────────────────────────────────────┐
-│ 1. 检查缓存 (固定)                        │
-│ 2. 选择数值分解策略 (可替换)              │
-│    - PINV: pinv_extended()               │
-│    - QR: np.linalg.qr() + solve()        │
-│ 3. 计算 β (固定: β = ... @ y)            │
-│ 4. 计算自由度 (固定)                      │
-│ 5. 创建结果对象 (固定)                    │
-└─────────────────────────────────────────┘
-```
-
-### 7.2 策略模式 (Strategy Pattern)
-
-通过 `method` 参数在运行时选择不同的数值分解策略：
-
-| 元素 | 实现 |
-|------|------|
-| **策略接口** | 产生相同的输出: `β`, `normalized_cov_params`, `rank` |
-| **具体策略 1** | `pinv` 方法: 使用 SVD 计算伪逆 |
-| **具体策略 2** | `qr` 方法: 使用 QR 分解 |
-| **上下文** | `RegressionModel.fit()` 方法 |
-
-### 7.3 工厂方法模式 (Factory Method)
-
-结果对象的创建使用了工厂方法思想：
+#### 保障 3：统一结果对象
 
 ```python
+# 无论使用哪种方法，都创建相同类型的结果对象
 if isinstance(self, OLS):
-    lfit = OLSResults(...)  # OLS 专用结果对象
+    lfit = OLSResults(
+        self,
+        beta,
+        normalized_cov_params=self.normalized_cov_params,
+        cov_type=cov_type,
+        cov_kwds=cov_kwds,
+        use_t=use_t,
+    )
 else:
-    lfit = RegressionResults(...)  # 通用结果对象
-```
+    lfit = RegressionResults(
+        self,
+        beta,
+        normalized_cov_params=self.normalized_cov_params,
+        cov_type=cov_type,
+        cov_kwds=cov_kwds,
+        use_t=use_t,
+        **kwargs,
+    )
 
-### 7.4 装饰器模式 (Decorator Pattern)
-
-`RegressionResultsWrapper` 装饰原始结果对象，提供更友好的 API：
-
-```python
+# 统一包装
 return RegressionResultsWrapper(lfit)
 ```
 
+### 6.3 与正常路径的对比
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    正常路径 vs 异常路径                                    │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  正常路径 (满秩矩阵):                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ 1. fit() 计算 β, normalized_cov_params, rank                         │  │
+│  │ 2. 创建 RegressionResults                                             │  │
+│  │ 3. 用户访问 results.params, results.bse, results.pvalues             │  │
+│  │ 4. 条件数小，无警告                                                    │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  异常路径 (秩亏/近奇异矩阵):                                                │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ PINV 方法:                                                            │  │
+│  │ 1. pinv_extended() 自动截断小奇异值                                   │  │
+│  │ 2. 计算 β (最小范数解)                                                │  │
+│  │ 3. 奇异值被缓存，可通过 condition_number 访问                         │  │
+│  │ 4. summary() 显示条件数，如果过大则添加警告注释                       │  │
+│  │                                                                      │  │
+│  │ QR 方法:                                                              │  │
+│  │ 1. np.linalg.solve() 可能抛出 LinAlgError (如果 R 严格奇异)         │  │
+│  │ 2. 即使成功，pinv_wexog 也被强制计算 (用于稳健协方差)                │  │
+│  │ 3. 奇异值和条件数同样可访问                                           │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  关键统一点:                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ ✓ 无论路径如何，结果对象类型相同                                      │  │
+│  │ ✓ 无论路径如何，诊断属性 (condition_number, eigenvals) 都可访问      │  │
+│  │ ✓ 无论路径如何，稳健协方差都能工作 (因为 pinv_wexog 存在)            │  │
+│  │ ✓ 警告通过统一的 warnings 机制传递                                    │  │
+│  │ ✓ 条件数等诊断信息在 summary() 中统一显示                             │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
-## 8. 代码参考位置速查
+## 7. 代码参考位置速查
 
 | 功能 | 文件路径 | 行号 |
 |------|----------|------|
-| RegressionModel 基类定义 | `linear_model.py` | 213-282 |
-| fit() 方法主入口 | `linear_model.py` | 284-415 |
-| PINV 策略实现 | `linear_model.py` | 349-365 |
-| QR 策略实现 | `linear_model.py` | 367-388 |
-| pinv_extended 函数 | `tools.py` | 244-265 |
-| initialize() 方法 | `linear_model.py` | 225-234 |
-| OLS.whiten() | `linear_model.py` | 1036-1054 |
-| WLS.whiten() | `linear_model.py` | 815-834 |
-| GLS.whiten() | `linear_model.py` | 587-614 |
-| RegressionResults 类 | `linear_model.py` | 1659-2806 |
-| get_robustcov_results() | `linear_model.py` | 2497-2806 |
+| **秩亏/近奇异处理** | | |
+| pinv_extended 函数 | `tools/tools.py` | 244-265 |
+| PINV 方法奇异值缓存 | `regression/linear_model.py` | 349-365 |
+| QR 方法兼容处理 | `regression/linear_model.py` | 367-388 |
+| eigenvals 属性 | `regression/linear_model.py` | 2044-2054 |
+| condition_number 属性 | `regression/linear_model.py` | 2056-2067 |
+| **异常处理** | | |
+| SingularMatrixWarning 定义 | `tools/sm_exceptions.py` | 148-151 |
+| yule_walker 异常处理模式 | `regression/linear_model.py` | 1575-1584 |
+| **稳健协方差依赖** | | |
+| _HCCM 核心函数 | `regression/linear_model.py` | 2070-2072 |
+| cov_HC0 实现 | `regression/linear_model.py` | 2078-2085 |
+| cov_HC1 实现 | `regression/linear_model.py` | 2087-2094 |
+| cov_HC2 实现 | `regression/linear_model.py` | 2096-2105 |
+| cov_HC3 实现 | `regression/linear_model.py` | 2107-2115 |
+| **诊断信息展示** | | |
+| summary() 诊断字典 | `regression/linear_model.py` | 2880-2890 |
+| summary() 条件数显示 | `regression/linear_model.py` | 2948-2953 |
 
 ---
 
-## 9. 设计优势与总结
+## 8. 总结与关键洞察
 
-### 9.1 设计优势
+### 8.1 核心设计哲学
 
-1. **用户友好**：
-   - 无需关心底层实现细节
-   - 只需选择 `method` 参数即可切换策略
-   - 所有模型使用相同的 `fit()` 接口
+Statsmodels 在异常路径上的统一接口设计遵循以下哲学：
 
-2. **可维护性**：
-   - 数值计算与统计推断逻辑分离
-   - 新增分解策略只需修改 `fit()` 方法的对应分支
-   - 不影响结果接口和后处理逻辑
+1. **数值鲁棒性优先**：
+   - PINV 方法通过 SVD 和奇异值截断内在地处理秩亏
+   - 即使选择 QR 方法，也强制计算伪逆以保证兼容性
 
-3. **可扩展性**：
-   - 新增模型只需继承 `RegressionModel` 并实现 `whiten()` 方法
-   - 自动获得所有数值分解策略的支持
-   - 协方差估计器独立开发，通过 `get_robustcov_results()` 集成
+2. **诊断透明性**：
+   - 奇异值、特征值、条件数等关键诊断信息始终可访问
+   - 汇总输出自动显示条件数，并在必要时添加警告
 
-### 9.2 核心要点总结
+3. **接口一致性**：
+   - 无论使用哪种估计方法，返回相同类型的结果对象
+   - 结果对象具有相同的属性和方法签名
 
-Statsmodels 的回归估计系统通过以下机制实现接口统一：
+### 8.2 关键设计决策
 
-1. **统一入口**：所有模型共享 `fit()` 方法，通过 `method` 参数选择策略
-2. **统一预处理**：`whiten()` 模板方法处理数据变换，`initialize()` 标准化初始化
-3. **统一输出**：无论使用哪种方法，都产生相同的中间结果格式
-4. **统一结果**：`RegressionResults` 类封装所有后处理逻辑，提供一致的推断 API
+| 决策 | 原因 | 影响 |
+|------|------|------|
+| QR 方法强制计算 `pinv_wexog` | 稳健协方差依赖伪逆 | 兼容性提高，但计算开销增加 |
+| 奇异值始终缓存 | 诊断信息需要 | 用户可以随时检查数值问题 |
+| 条件数在 summary() 中显示 | 帮助用户诊断问题 | 提高模型可解释性 |
+| 使用 warnings 而非异常 | 非致命问题不应中断流程 | 优雅退化，用户可选择处理 |
 
-这种设计使得：
-- **用户**：学习成本低，接口一致
-- **开发者**：代码复用率高，易于维护扩展
-- **代码质量**：逻辑清晰，职责分离
+### 8.3 潜在改进空间
+
+1. **QR 路径的显式异常处理**：
+   - 当前 `np.linalg.solve(R, effects)` 可能在 R 严格奇异时崩溃
+   - 应该添加 try-except 并回退到 PINV 方法
+
+2. **近奇异时的主动警告**：
+   - 当前只有条件数显示，没有主动警告
+   - 可以考虑在条件数超过阈值时发出 `CollinearityWarning`
+
+3. **秩亏时的系数解释**：
+   - 秩亏时系数估计不唯一
+   - 可以在结果对象中添加更多诊断信息
+
+---
+
+## 附录 A：快速检查表
+
+当遇到数值问题时，按以下顺序检查：
+
+### A.1 诊断检查清单
+
+```python
+results = model.fit()
+
+# 1. 检查条件数
+cond = results.condition_number
+print(f"条件数: {cond:.2e}")
+if cond > 1000:
+    print("⚠️  条件数较大，可能存在多重共线性")
+
+# 2. 检查特征值
+eig = results.eigenvals
+print(f"特征值范围: [{eig[-1]:.2e}, {eig[0]:.2e}]")
+if eig[-1] < 1e-10:
+    print("⚠️  最小特征值接近零，矩阵接近奇异")
+
+# 3. 检查秩
+print(f"矩阵秩: {results.rank}")
+print(f"自变量个数: {results.model.exog.shape[1]}")
+if results.rank < results.model.exog.shape[1]:
+    print("⚠️  矩阵秩亏!")
+
+# 4. 查看完整汇总
+print(results.summary())
+```
+
+### A.2 方法选择建议
+
+| 场景 | 推荐方法 | 理由 |
+|------|----------|------|
+| 满秩矩阵，追求速度 | `method="qr"` | QR 分解通常更快 |
+| 可能存在共线性 | `method="pinv"` (默认) | SVD 更数值稳定 |
+| 需要使用稳健协方差 | 任意 | 两种方法最终都计算 pinv |
+| 需要 ANOVA 分析 | `method="qr"` | QR 方法计算 effects |
+
+### A.3 常见警告类型
+
+| 警告类 | 触发场景 | 严重程度 |
+|--------|----------|----------|
+| `SingularMatrixWarning` | 矩阵求逆失败，使用 pinv 回退 | 中 |
+| `CollinearityWarning` | 变量高度相关 | 中 |
+| `ConvergenceWarning` | 优化算法未收敛 | 高 |
+| `HessianInversionWarning` | Hessian 不可逆，标准误不可用 | 高 |
