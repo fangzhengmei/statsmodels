@@ -1149,8 +1149,8 @@ base.Model（最基类，定义 from_formula）
     │
     ├── RegressionModel（⚠️ 重写 fit()，使用解析解）
     │   ├── GLS
-    │   │   └── WLS
-    │   │       └── OLS
+    │   ├── WLS
+    │   │   └── OLS
     │   └── GLSAR
     │
     ├── DiscreteModel（不重写 fit()，调用父类迭代优化）
@@ -1196,15 +1196,6 @@ base.Model（最基类，定义 from_formula）
 5. **公式接口与数组接口等价**：用户可以自由选择使用公式或直接传入数值矩阵
 
 ### 6.4 实际使用中的注意事项
-
-1. **预测时必须使用 DataFrame**：如果模型是通过公式创建的，预测时传入的新数据也必须是 DataFrame（或字典）
-
-2. **分类变量的一致性**：预测时分类变量可以包含训练时未见过的类别，但这些类别会被编码为全 0 列
-
-3. **求解机制的选择**：
-   - **线性回归**：使用 `method="pinv"`（默认）或 `"qr"`，无需关心迭代
-   - **Logit/Probit**：使用 `method="newton"`（默认），注意检查 `results.mle_retvals["converged"]`
-   - **GLM**：使用 `method="IRLS"`（默认），通常比纯梯度优化更稳定
 
 4. **迭代模型的起始参数**：Logit/Probit/Poisson 等迭代模型可以通过 `start_params` 提供更好的起始值，帮助收敛
 
