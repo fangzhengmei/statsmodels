@@ -87,13 +87,56 @@ def _get_sigma(sigma, nobs):
 
 **关键代码证据**：
 
-1. **伪逆的秩检测机制**（第 363 行）：
+1. **伪逆的奇异值截断机制**——决定病态矩阵下的核心表现
+
+**位置**：`statsmodels/tools/tools.py` 第 244-265 行
+
+```python
+def pinv_extended(x, rcond=1e-15):
+    """Return the pinv of an array X as well as the singular values
+    used in computation."""
+    x = np.asarray(x)
+    x = x.conjugate()
+    u, s, vt = np.linalg.svd(x, False)    # SVD 分解
+    s_orig = np.copy(s)
+    m = u.shape[0]
+    n = vt.shape[1]
+    cutoff = rcond * np.maximum.reduce(s)  # 关键：相对截断阈值
+    for i in range(min(n, m)):
+        if s[i] > cutoff:
+            s[i] = 1./s[i]                   # 大于阈值：取倒数
+        else:
+            s[i] = 0.                        # 小于阈值：截断为 0
+    res = np.dot(np.transpose(vt), np.multiply(s[:, np.newaxis],
+                                               np.transpose(u)))
+    return res, s_orig
+```
+
+**截断阈值的数学含义**：
+- 默认 `rcond=1e-15`，约等于双精度浮点数的机器精度 $\epsilon_\text{mach} \approx 2.2 \times 10^{-16}$
+- **相对阈值**：`cutoff = rcond * max(s)`，其中 `max(s)` 是最大奇异值
+- 任何奇异值满足 `s_i < rcond * s_max` 时被截断为 0
+
+**对病态矩阵的影响**：
+
+| 条件数 $\kappa(X) = s_\text{max}/s_\text{min}$ | 截断行为 | 实际效果 |
+|-----------------------------------------------|---------|---------|
+| $\kappa < 1/rcond \approx 10^{15}$ | 无截断或轻微截断 | 稳定求解，精度良好 |
+| $10^{15} < \kappa < 10^{16}$ | 部分小奇异值被截断 | 自动处理轻微共线性，返回最小二乘意义下的"最佳"解 |
+| $\kappa > 10^{16}$ | 多个奇异值被截断 | 自动检测秩亏，返回最小范数解 |
+
+**与 QR/Cholesky 的关键区别**：
+- 伪逆的截断是**显式、可控**的（通过 `rcond` 参数）
+- QR 的 `np.linalg.solve(R, ...)` 和 `np.linalg.inv(R'R)` 的数值稳定性由 LAPACK 内部处理，不提供显式截断
+- Cholesky 不做任何截断，奇异时直接报错
+
+2. **伪逆的秩检测机制**（`linear_model.py` 第 363 行）：
 ```python
 self.rank = np.linalg.matrix_rank(np.diag(singular_values))
 ```
 伪逆法通过奇异值显式计算秩，能够自动处理列共线性。
 
-2. **QR 方法的潜在问题**：
+3. **QR 方法的潜在问题**：
    - 第 376 行：`np.linalg.inv(np.dot(R.T, R))` 直接求逆，当 R 病态时精度差
    - 第 387 行：`np.linalg.solve(R, effects)` 使用回代，R 接近奇异时会警告或失败
 
