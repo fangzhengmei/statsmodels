@@ -125,7 +125,9 @@ def weights(self, mu):
 2. **`self.variance(mu)`**：调用方差函数 Var(μ)
 3. **组合**：w = 1 / (g'(μ)² * Var(μ))
 
-### 3.4 八个具体 Family 实现
+### 3.4 七个具体 Family 实现（基于源码）
+
+**源码确认**：`family.py` 中实际定义了 **7 个** 具体 Family 类（直接继承 `Family`）：
 
 | Family 类 | 默认 Link | 默认 Variance | 有效范围 | 特性 |
 |-----------|-----------|---------------|----------|------|
@@ -674,80 +676,6 @@ InverseGaussian.valid = [0, +∞]
 - `Binomial.safe_links = [Logit, CDFLink]` 而非 `[Logit, Probit, Cauchy]`
 - 这样任何新增的 CDFLink 子类自动成为安全链接
 - 体现了**开闭原则**：对扩展开放，对修改封闭
-
-### 5.2 链接验证机制
-
-**GLM 初始化时的验证** (`generalized_linear_model.py:315-327`):
-
-```python
-def __init__(self, endog, exog, family=None, ...):
-    # 检查链接是否在 safe_links 中
-    if (family is not None) and not isinstance(
-        family.link, tuple(family.safe_links)
-    ):
-        warnings.warn(
-            f"The {type(family.link).__name__} link function "
-            "does not respect the domain of the "
-            f"{type(family).__name__} family.",
-            DomainWarning,
-            stacklevel=2,
-        )
-```
-
-**Family 内部的链接设置** (`family.py:54-89`):
-
-```python
-def _setlink(self, link):
-    self._link = link
-    if self._check_link:
-        # 验证是否为 Link 实例
-        if not isinstance(link, L.Link):
-            raise TypeError("The input should be a valid Link object.")
-        # 验证是否在可用链接列表中
-        if hasattr(self, "links"):
-            validlink = max([isinstance(link, _) for _ in self.links])
-            if not validlink:
-                msg = "Invalid link for family, should be in %s. (got %s)"
-                raise ValueError(msg % (repr(self.links), link))
-```
-
-### 5.3 组合流程图
-
-```
-用户调用: sm.GLM(endog, exog, family=sm.families.Binomial(link=sm.families.links.Probit()))
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │  Binomial.__init__│
-                    │  - link = Probit() │
-                    │  - variance = Binary() │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │ Family._setlink │
-                    │ 检查: isinstance(Probit, Binomial.links)? │
-                    │ Binomial.links = [Logit, Probit, Cauchy, Log, ...] │
-                    │ ✓ Probit 在列表中 ✓ │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │ GLM.__init__    │
-                    │ 检查: isinstance(Probit, Binomial.safe_links)? │
-                    │ Binomial.safe_links = [Logit, CDFLink] │
-                    │ ✓ Probit 是 CDFLink 子类 ✓ │
-                    │ 无警告，继续 │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────────────────────────────────────┐
-                    │ 组合结果: GLM 持有 Family，Family 持有 Link     │
-                    │  GLM.family = Binomial(link=Probit())          │
-                    │  GLM.family.link = Probit()                      │
-                    │  GLM.family.variance = Binary(n=1)              │
-                    └─────────────────────────────────────────────────┘
-```
 
 ---
 
