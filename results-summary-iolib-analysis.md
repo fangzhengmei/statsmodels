@@ -609,18 +609,137 @@ def summary_model(results):
 
 ### 解耦的关键设计
 
-#### 1. Results 类不依赖展示层
+#### 1. 精确的依赖边界：延迟引入 vs 工具依赖
 
-**证据**: Results 类的导入关系
+**首先澄清：iolib 包的内部划分**
+
+`statsmodels.iolib` 包含多个职责不同的子模块，不能一概而论：
+
+| 子模块 | 职责 | 属于哪一层 |
+|--------|------|-----------|
+| `statsmodels.iolib.summary` | 摘要表格生成 | **展示层** |
+| `statsmodels.iolib.table` | 表格数据结构 | 数据结构层 |
+| `statsmodels.iolib.smpickle` | 模型持久化（pickle） | **持久化层**（非展示层） |
+| `statsmodels.iolib.foreign` | 数据导入（Stata等） | 数据导入层 |
+
+用户关注的是**结果层与展示层（summary）**的依赖边界，而非整个 iolib 包。
+
+---
+
+**Results 基类的实际依赖分析**
+
+**模块级别导入** (`base/model.py:1-36`)：
 
 ```python
-# base/model.py - 不导入任何 iolib 模块
-# 只有在 summary() 方法被调用时才动态导入
+# 这些是模块级别的导入，加载模块时即建立依赖
+from statsmodels.base.data import handle_data              # 数据处理
+from statsmodels.base.optimizer import Optimizer           # 优化器
+import statsmodels.base.wrapper as wrap                    # ← 结果包装器（工具依赖）
+from statsmodels.formula import handle_formula_data        # 公式处理
+from statsmodels.stats.contrast import (                   # 统计检验
+    ContrastResults, WaldTestResults, t_test_pairwise,
+)
+from statsmodels.tools.decorators import (                 # 工具装饰器
+    cache_readonly, cached_data, cached_value,
+)
+# ... 其他工具依赖
 
+# 关键点：模块级别没有导入任何 iolib 模块
+# from statsmodels.iolib.summary import Summary  ← 不存在
+# from statsmodels.iolib.table import SimpleTable  ← 不存在
+```
+
+**代码证据**：`base/model.py` 的导入部分（第 1-36 行）**确实没有** `statsmodels.iolib` 的模块级别导入。
+
+---
+
+**延迟引入的展示层能力**
+
+展示层依赖（`iolib.summary`）只在 `summary()` 方法被调用时才引入：
+
+```python
+# GenericLikelihoodModelResults.summary() 方法内 (base/model.py:3010)
 def summary(self, yname=None, xname=None, title=None, alpha=0.05):
-    # 延迟导入，避免循环依赖
-    from statsmodels.iolib.summary import Summary
+    # ... 准备数据 ...
+    
+    # 延迟导入：只有调用 summary() 时才建立展示层依赖
+    from statsmodels.iolib.summary import Summary  # ← 方法内延迟导入
+    
+    smry = Summary()
+    smry.add_table_2cols(self, ...)
+    smry.add_table_params(self, ...)
+    return smry
+```
+
+**其他具体 Results 子类的延迟导入模式**：
+
+```python
+# RegressionResults.summary() (linear_model.py)
+def summary(self, ...):
+    from statsmodels.iolib.summary import Summary  # 延迟导入
     ...
+
+# MLEResults.summary() (mlemodel.py)
+def summary(self, ...):
+    from statsmodels.iolib.summary import Summary   # 延迟导入
+    from statsmodels.iolib.table import SimpleTable  # 延迟导入
+    ...
+```
+
+---
+
+**结果层本身仍保留的工具依赖**
+
+不能说"完全不依赖"，Results 基类在**模块级别**确实保留了以下工具依赖：
+
+| 依赖来源 | 导入位置 | 依赖类型 | 说明 |
+|----------|----------|----------|------|
+| `statsmodels.base.wrapper` | 第 15 行，模块级别 | **工具依赖** | 结果包装器，用于数据框/序列包装 |
+| `statsmodels.formula.*` | 第 16-17 行，模块级别 | **工具依赖** | 公式接口支持 |
+| `statsmodels.stats.contrast` | 第 18-22 行，模块级别 | **工具依赖** | 统计检验（t_test, wald_test） |
+| `statsmodels.tools.*` | 第 23-35 行，模块级别 | **工具依赖** | 装饰器、数据处理、验证等 |
+
+此外，在**方法级别**还有非展示层的 iolib 依赖：
+
+```python
+# Results.save() 方法内 (base/model.py:2390)
+def save(self, fname, remove_data=False):
+    from statsmodels.iolib.smpickle import save_pickle  # 持久化，非展示层
+    save_pickle(self, fname)
+
+# Results.load() 类方法内 (base/model.py:2419)
+@classmethod
+def load(cls, fname):
+    from statsmodels.iolib.smpickle import load_pickle  # 持久化，非展示层
+    return load_pickle(fname)
+```
+
+**关键区分**：
+- `iolib.summary` → **展示层**（用户关注的边界）
+- `iolib.smpickle` → **持久化层**（工具功能，非展示层）
+
+---
+
+**依赖关系的精确图示**
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Results 基类 (base/model.py)               │
+│                                                               │
+│  【模块级别已建立的依赖】                                       │
+│  ├── statsmodels.base.wrapper        ← 工具依赖（包装器）    │
+│  ├── statsmodels.formula.*           ← 工具依赖（公式）      │
+│  ├── statsmodels.stats.contrast     ← 工具依赖（检验）      │
+│  └── statsmodels.tools.*             ← 工具依赖（装饰器等）  │
+│                                                               │
+│  【方法级别延迟引入的依赖】                                     │
+│  ├── save()/load() 方法                                      │
+│  │   └── iolib.smpickle  ← 持久化层（非展示层）              │
+│  │                                                             │
+│  └── summary() 方法                                           │
+│      └── iolib.summary  ← 【展示层】（用户关注的边界）        │
+│          └── 只有调用 summary() 时才建立此依赖                 │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 #### 2. Summary 类通过契约访问数据
@@ -883,13 +1002,62 @@ Results (base/model.py:1112)
 
 ### 架构设计的核心原则
 
-1. **延迟依赖**: Results 类不在模块层面导入 iolib，只在 `summary()` 调用时延迟导入
+1. **混合导入策略** (修正表述):
+   - **Results 基类** (`base/model.py`): 完全不导入 iolib，实现真正的解耦
+   - **具体 Results 子类** (`linear_model.py`, `mlemodel.py` 等): 在 `summary()` 方法内延迟导入
+   - **部分时间序列模块** (`vecm.py`, `var_model.py`, `ar_model.py` 等): 在模块顶层导入展示层类
+   
 2. **契约设计**: 展示层通过属性访问契约与结果层交互，不依赖具体类
 3. **惰性计算**: 计算开销大的指标使用 `@cache_readonly` 实现按需计算+缓存
 4. **职责分离**:
    - 计算层：模型拟合、参数估计
    - 结果层：数据持有、指标计算
    - 展示层：表格组装、格式输出
+
+### 离散模型继承关系的关键修正
+
+**之前的不准确表述**: 认为 `GenericLikelihoodModelResults` 是离散模型的基类
+
+**正确的继承关系** (代码证据支撑):
+
+```
+LikelihoodModelResults (base/model.py:1276)
+│
+├── GenericLikelihoodModelResults (base/model.py:2802)
+│   ├── 继承: LikelihoodModelResults + ResultMixin
+│   └── 用途: GenericLikelihoodModel 的默认结果类
+│
+└── DiscreteResults (discrete/discrete_model.py:4905)
+    ├── 继承: base.LikelihoodModelResults (直接继承，不经过 GenericLikelihoodModelResults)
+    └── 子分支:
+        ├── CountResults → PoissonResults, NegativeBinomialResults, 等
+        ├── BinaryResults → LogitResults, ProbitResults
+        ├── OrderedResults
+        └── MultinomialResults → MNLogitResults
+```
+
+**代码证据**:
+- `discrete/discrete_model.py:4905`: `class DiscreteResults(base.LikelihoodModelResults):`
+- 离散模型的 `fit()` 方法直接创建具体的 Results 实例（如 `LogitResults(self, bnryfit)`），而非通过 `GenericLikelihoodModelResults`
+
+### 依赖边界的关键修正
+
+**之前的不准确表述**: 认为所有 Results 类都采用延迟导入
+
+**实际情况**:
+
+| 层级 | 导入策略 | 代码证据 |
+|------|----------|----------|
+| **Results 基类** (`base/model.py`) | 完全不导入 iolib | 模块顶层无 `from statsmodels.iolib import ...` |
+| **RegressionResults** | 方法内延迟导入 | `linear_model.py` 的 `summary()` 内导入 |
+| **MLEResults** | 方法内延迟导入 | `mlemodel.py` 的 `summary()` 内导入 |
+| **VECM 模块** | 模块顶层导入 | `vecm.py:9-10`: `from statsmodels.iolib.summary import Summary` |
+| **VAR 模块** | 模块顶层导入 | `var_model.py:21`: `from statsmodels.iolib.table import SimpleTable` |
+| **AR 模块** | 模块顶层导入 | `ar_model.py:22`: `from statsmodels.iolib.summary import Summary` |
+
+**核心解耦仍然成立**:
+- 展示层 (`iolib/summary.py`, `iolib/table.py`) **从不**导入任何 Results 类
+- 展示层只依赖属性访问契约（如 `params`, `bse`, `tvalues` 等属性）
 
 ### 新旧接口对比
 
