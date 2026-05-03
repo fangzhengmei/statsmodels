@@ -415,7 +415,7 @@ IRLS 算法的逻辑并非集中在一处，而是分散在三个层次：
 ```python
 def _check_convergence(criterion, iteration, tol, maxiter):
     cond = np.abs(criterion[iteration] - criterion[iteration - 1])
-    return not (np.any(conv > tol) and iteration < maxiter)
+    return not (np.any(cond > tol) and iteration < maxiter)
 ```
 
 支持的收敛准则（通过 `conv` 参数选择）：
