@@ -330,17 +330,9 @@ class Probit(CDFLink):
 
 ## 5. 笛卡尔积组合机制
 
-### 5.1 组合约束的声明
+### 5.1 组合约束的声明：代码 vs 文档
 
-每个 Family 通过类属性声明可用链接：
-
-```python
-class Poisson(Family):
-    links = [L.Log, L.Identity, L.Sqrt]      # 技术上可用的链接
-    variance = V.mu
-    valid = [0, np.inf]
-    safe_links = [L.Log]                     # 推荐的"安全"链接
-```
+#### 文档中的组合表（注意：不完整）
 
 **文档中的组合表** (`generalized_linear_model.py:227-239`):
 
@@ -357,6 +349,331 @@ gamma         x     x                        x
 Tweedie       x     x                        x
 ============= ===== === ===== ====== ======= === ==== ====== ====== ====
 ```
+
+**重要提示**：文档明确注释说 *"Not all of these link functions are currently available"*。文档表中的 `opow` (odds power), `nbinom` (NegativeBinomial 专用链接) 等并非所有 Family 都实际支持。**代码是事实标准**。
+
+#### 代码中的实际约束定义
+
+每个 Family 通过两个类属性声明约束：
+
+```python
+class Poisson(Family):
+    links = [L.Log, L.Identity, L.Sqrt]      # 第一层：技术可用的链接（硬约束）
+    variance = V.mu
+    valid = [0, np.inf]
+    safe_links = [L.Log]                       # 第二层：推荐的安全链接（软约束）
+```
+
+### 5.1.1 完整的组合约束表（基于代码）
+
+| Family | `links` 列表（技术可用） | 数量 | `safe_links` 列表（推荐安全） | 实际覆盖（考虑继承） | 数量 | 默认 Link |
+|--------|--------------------------|------|-------------------------------|---------------------|------|------------|
+| **Gaussian** | [Log, Identity, InversePower] | 3 | same as `links` | same | 3 | `Identity()` |
+| **Poisson** | [Log, Identity, Sqrt] | 3 | [Log] | [Log] | 1 | `Log()` |
+| **Binomial** | [Logit, Probit, Cauchy, Log, LogC, CLogLog, LogLog, Identity] | 8 | [Logit, CDFLink] | Logit, Probit, Cauchy | 3 | `Logit()` |
+| **Gamma** | [Log, Identity, InversePower] | 3 | [Log] | [Log] | 1 | `InversePower()` |
+| **InverseGaussian** | [InverseSquared, InversePower, Identity, Log] | 4 | [InverseSquared, Log] | same | 2 | `InverseSquared()` |
+| **NegativeBinomial** | [Log, CLogLog, Identity, NegativeBinomial, Power] | 5 | [Log] | [Log] | 1 | `Log()` |
+| **Tweedie** | [Log, Power] | 2 | [Log, Power] | same | 2 | `Log()` |
+
+**总计**：
+- **技术可用组合**：3 + 3 + 8 + 3 + 4 + 5 + 2 = **28 个**
+- **安全推荐组合**：3 + 1 + 3 + 1 + 2 + 1 + 2 = **13 个**
+
+### 5.1.2 关键发现：继承关系扩展了 safe_links 的覆盖范围
+
+**Binomial 的特殊情况**：
+
+代码中 `Binomial.safe_links = [L.Logit, L.CDFLink]`，但实际覆盖的链接更多：
+
+```
+Link 继承关系：
+Link ──► Logit ──► CDFLink ──► Probit
+                       └──────► Cauchy
+```
+
+由于校验使用 `isinstance()` 检查：
+- `isinstance(Probit(), L.CDFLink)` → **True**
+- `isinstance(Cauchy(), L.CDFLink)` → **True**
+
+所以 Binomial 的 safe_links 实际覆盖 **3 个链接**：Logit、Probit、Cauchy。
+
+**设计意图**：CDFLink 是所有基于分布 CDF 的链接的基类。任何连续分布的 CDF 值域都是 [0, 1]，完全包含 Binomial 均值的有效域 (0, 1)，因此都是"安全"的。
+
+---
+
+### 5.4 链接校验的分层实现机制
+
+#### 为什么需要两层校验？
+
+statsmodels 的链接校验设计了**两层机制**，每层有不同的目的和严厉程度：
+
+| 层级 | 实现位置 | 检查目标 | 校验方式 | 违规后果 | 可禁用？ |
+|------|----------|----------|----------|----------|----------|
+| **第一层（硬约束）** | `Family._setlink()` | 技术可行性 | `isinstance(link, tuple(family.links))` | **抛出 ValueError** | ✅ `check_link=False` |
+| **第二层（软约束）** | `GLM.__init__()` | 定义域安全性 | `isinstance(family.link, tuple(family.safe_links))` | **发出 DomainWarning** | ❌ 不可禁用 |
+
+#### 第一层：技术可行性校验（_setlink）
+
+**代码位置**：`family.py:73-88`
+
+```python
+def _setlink(self, link):
+    self._link = link
+    if self._check_link:
+        # 检查 1: 是否为 Link 实例
+        if not isinstance(link, L.Link):
+            raise TypeError("The input should be a valid Link object.")
+        # 检查 2: 是否在技术可用列表中（支持子类继承）
+        if hasattr(self, "links"):
+            validlink = max([isinstance(link, _) for _ in self.links])
+            if not validlink:
+                msg = "Invalid link for family, should be in %s. (got %s)"
+                raise ValueError(msg % (repr(self.links), link))
+```
+
+**设计意图**：确保链接函数**在数学上定义完整**，GLM 算法可以执行。
+
+**什么是"技术可用"？**
+- 链接函数实现了完整接口：`__call__`, `inverse`, `deriv`
+- 逆链接函数有定义（尽管可能在某些输入下越界）
+- 示例：Poisson + Identity 技术可用，因为 Identity 有完整实现
+
+#### 第二层：定义域安全性校验（GLM.__init__）
+
+**代码位置**：`generalized_linear_model.py:315-327`
+
+```python
+def __init__(self, endog, exog, family=None, ...):
+    # 检查链接是否尊重均值的有效域
+    if (family is not None) and not isinstance(
+        family.link, tuple(family.safe_links)
+    ):
+        warnings.warn(
+            f"The {type(family.link).__name__} link function "
+            "does not respect the domain of the "
+            f"{type(family).__name__} family.",
+            DomainWarning,
+            stacklevel=2,
+        )
+```
+
+**设计意图**：确保逆链接函数的值域**完全包含**在均值的有效域内，避免运行时数值问题。
+
+**什么是"安全"？**
+- 逆链接函数的值域 ⊆ Family.valid（均值的有效范围）
+- 对任意线性预测 η ∈ ℝ，μ = g⁻¹(η) 都在有效范围内
+
+#### 两层校验的流程图
+
+```
+用户调用: sm.GLM(endog, exog, family=Poisson(link=Identity()))
+                              │
+                              ▼
+                    ┌─────────────────────────┐
+                    │  Poisson.__init__       │
+                    │  link = Identity()      │
+                    └───────────┬─────────────┘
+                                │
+                                ▼
+                    ╔═══════════════════════════════════════════════════╗
+                    ║  第一层校验: Family._setlink()  [硬约束]          ║
+                    ╠═══════════════════════════════════════════════════╣
+                    ║  检查: isinstance(Identity(), tuple(Poisson.links))║
+                    ║  Poisson.links = [Log, Identity, Sqrt]            ║
+                    ║  isinstance(Identity(), L.Identity) = True         ║
+                    ║  ✓ 通过，无异常                                     ║
+                    ╚═══════════════════════╤═══════════════════════════╝
+                                                │
+                                                ▼
+                    ╔═══════════════════════════════════════════════════╗
+                    ║  第二层校验: GLM.__init__()  [软约束]             ║
+                    ╠═══════════════════════════════════════════════════╣
+                    ║  检查: isinstance(Identity(), tuple(Poisson.safe_links))║
+                    ║  Poisson.safe_links = [Log]                        ║
+                    ║  isinstance(Identity(), L.Log) = False             ║
+                    ║  ✗ 不通过，发出警告                                 ║
+                    ╚═══════════════════════╤═══════════════════════════╝
+                                                │
+                                                ▼
+                    ┌─────────────────────────────────────────────────────┐
+                    │  结果: 模型继续创建，但用户收到警告                   │
+                    │  DomainWarning: The Identity link function          │
+                    │  does not respect the domain of the Poisson family. │
+                    └─────────────────────────────────────────────────────┘
+```
+
+---
+
+### 5.5 关键组合差异与设计取舍
+
+#### 核心问题：为什么某些组合"不安全"？
+
+**安全的本质**：逆链接函数的值域必须完全包含在均值的有效域内。
+
+```
+安全条件: 对任意 η ∈ ℝ，g⁻¹(η) ∈ Family.valid
+
+其中:
+- η = Xβ 是线性预测，可以是任意实数
+- μ = g⁻¹(η) 是均值预测，必须在有效范围内
+- Family.valid 是均值的有效范围
+```
+
+#### 各 Family 的安全分析
+
+##### 1. Gaussian：所有链接都安全
+
+```
+Gaussian.valid = [-∞, +∞]  (均值无约束，可以是任意实数)
+```
+
+**为什么安全？**
+- 任何 Link 的 inverse 值域都是 ℝ 的子集
+- 而 Gaussian.valid = ℝ，所以永远满足
+- 因此 `Gaussian.safe_links = Gaussian.links`
+
+**可选链接分析**：
+| Link | inverse(η) | 值域 | 是否在 [-∞, +∞]？ |
+|------|------------|------|-------------------|
+| Identity | η | ℝ | ✅ |
+| Log | exp(η) | (0, +∞) | ✅ (子集) |
+| InversePower | 1/η | ℝ \ {0} | ✅ (子集) |
+
+##### 2. Poisson / Gamma / NegativeBinomial：只有 Log 安全
+
+```
+Poisson.valid = Gamma.valid = NegativeBinomial.valid = [0, +∞]
+(均值必须非负，计数/正值数据)
+```
+
+**为什么只有 Log 安全？**
+
+| Link | inverse(η) = μ | 值域 | 是否 ⊆ [0, +∞)？ | 问题点 |
+|------|-----------------|------|-------------------|--------|
+| **Log** | exp(η) | (0, +∞) | ✅ | 永远为正 |
+| Identity | η | ℝ | ❌ | η < 0 时 μ 为负 |
+| Sqrt | η² | [0, +∞) | ⚠️ | 值域对，但 η 为虚数问题 |
+| InversePower | 1/η | ℝ \ {0} | ❌ | η < 0 时 μ 为负 |
+
+**Poisson + Identity 的风险示例**：
+```python
+import numpy as np
+import statsmodels.api as sm
+
+# 假设模型预测 η = Xβ = -2
+eta = -2
+link = sm.families.links.Identity()
+mu = link.inverse(eta)  # mu = -2
+
+# 问题：
+# 1. Poisson 均值必须 > 0，但 mu = -2
+# 2. family.variance(mu) = mu = -2，方差不能为负
+# 3. IRLS 权重 = 1/(g'(μ)² * Var(μ)) = 1/(1 * -2)，出现复数或 NaN
+```
+
+##### 3. Binomial：CDF 类型的链接都安全
+
+```
+Binomial.valid = (0, 1)  (概率，必须在 0 和 1 之间)
+```
+
+**安全链接分析**：
+
+| Link | inverse(η) = μ | 值域 | 是否 ⊆ (0, 1)？ | 类型 |
+|------|-----------------|------|-------------------|------|
+| **Logit** | sigmoid(η) = exp(η)/(1+exp(η)) | (0, 1) | ✅ | CDF-like |
+| **Probit** | Φ(η) 标准正态 CDF | (0, 1) | ✅ | CDF |
+| **Cauchy** | Cauchy.cdf(η) | (0, 1) | ✅ | CDF |
+| Log | exp(η) | (0, +∞) | ❌ | η > 0 时 μ > 1 |
+| LogC | 1 - exp(η) | (-∞, 1) | ❌ | η < 0 时 μ < 0 |
+| CLogLog | 1 - exp(-exp(η)) | (0, 1) | ⚠️ | 值域对，但数值稳定性 |
+| LogLog | exp(-exp(-η)) | (0, 1) | ⚠️ | 值域对，但数值稳定性 |
+| Identity | η | ℝ | ❌ | 大部分 η 不在 (0,1) |
+
+**为什么 Probit/Cauchy 安全？**
+- 它们继承自 `CDFLink`
+- 任何连续分布的 CDF 值域都是 [0, 1]
+- 对任意 η ∈ ℝ，0 < CDF(η) < 1
+
+**Binomial + Log 的风险示例**：
+```python
+eta = 2  # 线性预测
+link = sm.families.links.Log()
+mu = link.inverse(eta)  # mu = exp(2) ≈ 7.389
+
+# 问题：mu = 7.389，但概率必须在 (0, 1) 之间
+# 这会导致：
+# 1. 方差 = mu * (1 - mu) = 7.389 * (-6.389) ≈ -47.2，方差为负
+# 2. IRLS 权重 = 1/(g'(μ)² * Var(μ))，出现复数或 NaN
+# 3. 对数似然计算：log(μ^y * (1-μ)^(n-y))，log(负数) = -inf
+```
+
+##### 4. InverseGaussian：InverseSquared 和 Log 安全
+
+```
+InverseGaussian.valid = [0, +∞]
+```
+
+| Link | inverse(η) | 值域 | 是否 ⊆ [0, +∞)？ |
+|------|------------|------|-------------------|
+| **InverseSquared** | 1/√η (当 η > 0) | ⚠️ | 详见下方 |
+| **Log** | exp(η) | (0, +∞) | ✅ |
+| Identity | η | ℝ | ❌ |
+| InversePower | 1/η | ℝ \ {0} | ❌ |
+
+**InverseSquared 的特殊设计**：
+- 数学定义：g(μ) = 1/μ²
+- 逆函数：g⁻¹(η) = 1/√η，仅当 η > 0
+- 但 InverseSquared 被标记为"安全"链接
+
+**为什么？** 查看 `InverseSquared._clean` 和实际实现：
+- 可能有数值裁剪或特殊处理
+- 或者这是历史遗留的设计选择
+
+---
+
+### 5.6 设计取舍总结
+
+#### 为什么分层实现？
+
+| 维度 | 第一层 (links) | 第二层 (safe_links) |
+|------|----------------|---------------------|
+| **设计目标** | 确保算法可执行 | 确保数值稳定、结果有意义 |
+| **校验内容** | Link 接口完整性 | 逆链接值域 ⊆ 均值有效域 |
+| **严厉程度** | 硬约束（异常） | 软约束（警告） |
+| **用户选择** | 可禁用（专家模式） | 不可禁用（必须知晓） |
+| **典型违规** | 使用完全未定义的链接 | 技术可用但有数值风险 |
+
+#### 设计哲学
+
+1. **用户友好性**：
+   - 新手用户使用默认链接，不会遇到问题
+   - 有风险的组合会发出警告，提示用户注意
+
+2. **专家灵活性**：
+   - `check_link=False` 允许专家绕过第一层校验
+   - 可以尝试非常规组合（如 Poisson + Identity 用于特定数据）
+
+3. **渐进式约束**：
+   - 不是简单的"允许/禁止"二元选择
+   - 而是"允许但警告"，让用户知情决策
+
+#### 文档与代码的差异处理
+
+**问题**：文档中的组合表比代码实际支持的多。
+
+**处理方式**：
+1. 文档明确注释"Not all of these link functions are currently available"
+2. 代码是事实标准，运行时通过 `isinstance` 检查实际支持
+3. 这允许文档前瞻性地列出计划支持的链接，而代码逐步实现
+
+#### 继承关系的巧妙运用
+
+`safe_links` 使用基类而非具体类：
+- `Binomial.safe_links = [Logit, CDFLink]` 而非 `[Logit, Probit, Cauchy]`
+- 这样任何新增的 CDFLink 子类自动成为安全链接
+- 体现了**开闭原则**：对扩展开放，对修改封闭
 
 ### 5.2 链接验证机制
 
