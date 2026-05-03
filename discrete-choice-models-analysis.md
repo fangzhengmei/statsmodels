@@ -1566,4 +1566,1452 @@ def analyze_margeff(me, model):
 
 #### 5. 隐式约定过多
 
-**扩展新模型需要理解
+**扩展新模型需要理解多个隐式约定**：
+
+| 隐式约定 | 说明 | 位置 |
+|----------|------|------|
+| **参数扁平化顺序** | 使用 Fortran 顺序 (`order="F"`) | `MNLogit.loglike()`, `score()`, `hessian()` |
+| **基准类别处理** | 多项模型假设第一类是基准类别，参数为0 | `MultinomialModel.initialize()`, `MNLogit.cdf()` |
+| **结果类配套** | 每个模型类需要配套结果类和 Wrapper 类 | 模块末尾的 `wrap.populate_wrapper()` 调用 |
+| **offset 支持** | 二元模型支持 offset，多项模型可能不支持 | `BinaryModel.predict()` 有 offset 参数 |
+| **分离检测** | 二元模型有分离检测，多项模型没有 | `BinaryResults.summary()` |
+
+**新模型开发者需要理解的隐式约定**：
+
+```python
+# 假设要添加一个新模型 NewModel
+class NewModel(BinaryModel):
+    def cdf(self, X):
+        pass  # 必须实现
+    
+    def pdf(self, X):
+        pass  # 必须实现（如果是二元模型）
+    
+    def loglike(self, params):
+        pass  # 必须实现
+    
+    def score(self, params):
+        pass  # 必须实现
+    
+    def hessian(self, params):
+        pass  # 必须实现
+
+# 还需要配套结果类
+class NewModelResults(BinaryResults):
+    pass  # 可能需要特化某些方法
+
+# 还需要 Wrapper 类
+class NewModelResultsWrapper(lm.RegressionResultsWrapper):
+    pass
+
+# 最后需要注册
+wrap.populate_wrapper(NewModelResultsWrapper, NewModelResults)
+```
+
+#### 6. 多重继承的复杂性
+
+**L1 正则化结果类使用多重继承**：
+
+```python
+class L1BinaryResults(BinaryResults):
+    pass
+
+class L1PoissonResults(L1CountResults, PoissonResults):
+    # 多重继承
+    # MRO: L1PoissonResults -> L1CountResults -> CountResults -> DiscreteResults -> ...
+    #                       -> PoissonResults -> CountResults -> DiscreteResults -> ...
+    pass
+```
+
+**问题**：
+- `__init__` 方法的调用顺序可能不符合预期
+- 方法重写冲突：如果两个父类都有同名方法，哪个被调用？
+- `super()` 的行为依赖于 MRO（方法解析顺序）
+
+### 5.3 限制总结（修正版）
+
+| 限制类型 | 具体问题 | 影响 | 严重程度 |
+|----------|----------|------|----------|
+| **继承层次语义错误** | MultinomialModel 继承 BinaryModel | 设计混乱，扩展困难 | 🔴 高 |
+| **pdf() 方法不一致** | MNLogit 不实现 pdf()，依赖父类重写 | 运行时错误风险 | 🟠 中 |
+| **参数形状不一致** | 二元 1D vs 多项 2D | 用户代码需要分支处理 | 🟠 中 |
+| **边际效应形状不一致** | 二元 (K,) vs 多项 (K, J) | 接口不统一 | 🟠 中 |
+| **隐式约定过多** | F 顺序、基准类别、结果类配套 | 扩展成本高 | 🟠 中 |
+| **多重继承复杂** | L1 结果类的 MRO 问题 | 调试困难 | 🟡 低 |
+
+## 6. 修正后的结论
+
+### 6.1 设计亮点总结
+
+**1. 清晰的层次职责划分**：
+
+```
+LikelihoodModel (最顶层)
+├── 定义 loglike/score/hessian 抽象接口
+├── 实现通用 fit() 方法
+└── 职责：MLE 框架
+
+DiscreteModel (中间层)
+├── 定义 cdf/pdf/predict/_derivative_exog 抽象接口
+├── 重写 fit() 添加分离检测
+└── 职责：离散模型特有的接口
+
+BinaryModel / MultinomialModel (中间层)
+├── 实现 predict() - 调用子类 cdf()
+├── 实现 _derivative_exog() - 调用子类 pdf() 或特化公式
+└── 职责：二元/多项模型通用框架
+
+Logit / Probit / MNLogit (最底层)
+├── 实现 cdf()/pdf()
+├── 实现 loglike()/score()/hessian()
+└── 职责：具体模型特化
+```
+
+**2. Template Method 模式的有效应用**：
+
+| 模板方法 | 固定部分 | 可变部分 | 实现位置 |
+|----------|----------|----------|----------|
+| `BinaryModel.predict()` | 计算 Xβ + offset | 调用 `self.cdf(linpred)` | `discrete_model.py:538` |
+| `BinaryModel._derivative_exog()` | 应用公式 `f(Xβ)*β` | 调用 `self.pdf(linpred)` | `discrete_model.py:670` |
+| `DiscreteModel.fit()` | 添加分离检测 callback | 调用 `super().fit()` | `discrete_model.py:242` |
+
+**3. 统一的 MLE 框架**：
+
+所有离散模型共享：
+- 相同的优化方法支持
+- 相同的收敛检测
+- 相同的结果包装
+
+**4. 结果层的接口一致性**：
+
+用户代码对所有模型都相同：
+```python
+results = model.fit()
+results.summary()        # 摘要
+results.get_margeff()    # 边际效应
+results.predict(X_new)   # 预测
+```
+
+### 6.2 设计缺陷总结
+
+**1. 继承层次的根本问题**：
+
+```
+当前设计：
+MultinomialModel ──继承──> BinaryModel
+    │                          │
+    │  多项模型                │  二元模型
+    │  不是二元模型的特例       │  实际上是多项模型的特例
+    │  (J=2)                   │  (J=2)
+
+问题：语义上完全相反！
+```
+
+**2. 不一致的抽象方法实现**：
+
+| 类 | cdf() | pdf() | loglike() | score() | hessian() |
+|------|-------|-------|-----------|---------|-----------|
+| Logit | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Probit | ✅ | ✅ | ✅ | ✅ | ✅ |
+| MNLogit | ✅ | ❌ | ✅ | ✅ | ✅ |
+
+**问题**：`pdf()` 是 `DiscreteModel` 定义的抽象方法，但 `MNLogit` 没有实现它。这依赖于 `MultinomialModel` 重写 `_derivative_exog()` 来避免调用 `pdf()`，是一种脆弱的设计。
+
+**3. 参数形状的不一致性**：
+
+| 属性 | 二元模型 (Logit/Probit) | 多项模型 (MNLogit) |
+|------|------------------------|---------------------|
+| `params` | (K,) | (K, J-1) |
+| `bse` | (K,) | (K, J-1) |
+| `tvalues` | (K,) | (K, J-1) |
+| `pvalues` | (K,) | (K, J-1) |
+| `conf_int()` | (K, 2) | (J, K, 2) |
+
+### 6.3 实际使用建议
+
+#### 对于用户：
+
+1. **使用统一接口**：
+   ```python
+   # 推荐：使用统一接口
+   results = model.fit()
+   results.summary()        # 所有模型相同
+   results.get_margeff()    # 所有模型相同
+   results.predict(X_new)   # 所有模型相同
+   ```
+
+2. **处理多项模型参数时注意形状**：
+   ```python
+   # 多项模型
+   if hasattr(results.model, 'J') and results.model.J > 1:
+       params = results.params  # (K, J-1)
+       for j in range(results.model.J - 1):
+           print(f"方程 {j + 1}:", params[:, j])
+   else:
+       params = results.params  # (K,)
+       print(params)
+   ```
+
+3. **边际效应解释**：
+   - 二元模型：直接解释为概率变化
+   - 多项模型：每个类别的概率变化单独解释，注意基准类别
+
+#### 对于扩展者：
+
+1. **二元模型扩展**：
+   ```python
+   class NewBinaryModel(BinaryModel):
+       # 必需方法
+       def cdf(self, X):
+           pass
+       
+       def pdf(self, X):
+           pass
+       
+       def loglike(self, params):
+           pass
+       
+       def score(self, params):
+           pass
+       
+       def hessian(self, params):
+           pass
+   
+   # 配套结果类（通常不需要特化）
+   class NewBinaryModelResults(BinaryResults):
+       pass
+   ```
+
+2. **多项模型扩展**：
+   - 注意：`MultinomialModel` 继承 `BinaryModel`，但多项模型不是二元模型的特例
+   - 如果需要扩展多项模型，考虑直接继承 `DiscreteModel`
+
+3. **不要忘记 Wrapper 类**：
+   ```python
+   # 在模块末尾
+   wrap.populate_wrapper(NewBinaryModelResultsWrapper, NewBinaryModelResults)
+   ```
+
+#### 对于维护者：
+
+1. **考虑重构继承层次**：
+   ```python
+   # 建议的新设计
+   DiscreteModel
+   ├── BinaryChoiceModel      # 独立继承
+   │    ├── Logit
+   │    └── Probit
+   ├── MultinomialChoiceModel  # 独立继承，不继承 BinaryChoiceModel
+   │    └── MNLogit
+   └── OrderedChoiceModel      # 新增有序选择模型
+        ├── OrderedLogit
+        └── OrderedProbit
+   ```
+
+2. **显式化接口约定**：
+   - 使用 ABC 强制 `pdf()` 实现
+   - 或者从 `DiscreteModel` 中移除 `pdf()`，改为二元模型特有的抽象方法
+
+3. **统一参数形状处理**：
+   - 考虑始终使用扁平化参数
+   - 提供 `reshape_params()` 方法进行维度转换
+
+### 6.4 权衡分析
+
+**继承体系的好处与限制的权衡**：
+
+| 设计决策 | 好处 | 限制 | 是否值得 |
+|----------|------|------|----------|
+| 统一 MLE 框架 | 代码复用、接口一致 | 灵活性降低 | ✅ 值得 |
+| Template Method (predict) | 新增模型只需实现 cdf | 灵活性降低 | ✅ 值得 |
+| Template Method (_derivative_exog) | 二元模型只需实现 pdf | MNLogit 不实现 pdf，依赖重写 | ⚠️ 值得但需改进 |
+| MultinomialModel 继承 BinaryModel | 代码复用（可能） | 语义错误、设计混乱 | ❌ 不值得，应重构 |
+| 参数形状不一致 | 符合直觉（多项模型是多方程） | 用户代码需要分支处理 | ⚠️ 权衡结果，提供转换方法 |
+
+### 6.5 最终结论
+
+**Statsmodels 离散选择模型的继承体系**：
+
+**优点**：
+- ✅ **MLE 框架完全统一**：所有模型共享同一套拟合机制
+- ✅ **Template Method 有效应用**：`predict()` 和 `_derivative_exog()` 实现了通用框架
+- ✅ **结果层接口一致**：用户代码对所有模型都相同
+- ✅ **多态行为**：新增模型只需特化差异部分
+
+**缺点**：
+- ❌ **继承层次语义错误**：`MultinomialModel` 继承 `BinaryModel` 是根本的设计缺陷
+- ❌ **抽象方法不一致**：`MNLogit` 不实现 `pdf()`，依赖脆弱的重写机制
+- ⚠️ **参数形状不一致**：二元模型 1D vs 多项模型 2D，用户代码需要分支处理
+- ⚠️ **隐式约定过多**：F 顺序、基准类别、结果类配套等
+
+**建议的改进优先级**：
+
+1. **高优先级**：重构继承层次，让 `MultinomialModel` 独立继承 `DiscreteModel`，不再继承 `BinaryModel`
+2. **中优先级**：显式化 `pdf()` 方法约定，要么强制所有模型实现，要么将其移到二元模型层
+3. **中优先级**：提供统一的参数形状转换方法，简化用户代码
+4. **低优先级**：改进多重继承的使用，或使用组合替代
+
+## 7. 数值稳定处理：二元与多元模型的差异（可核验深度）
+
+### 7.1 数值稳定常量定义
+
+**位置**：`discrete_model.py:68-71`
+
+```python
+FLOAT_EPS = np.finfo(float).eps  # ~2.22e-16
+EXP_UPPER_LIMIT = np.log(np.finfo(np.float64).max) - 1.0  # ~709
+```
+
+**用途**：
+- `FLOAT_EPS`：防止除零和 `log(0)`
+- `EXP_UPPER_LIMIT`：防止指数上溢（`exp(709) ≈ 1e308` 是 float64 的最大值）
+
+### 7.2 Logit 模型的数值稳定处理
+
+**核心策略**：利用 Logistic 分布的对称性，避免直接计算 `exp()` 的极端值。
+
+**位置**：`discrete_model.py:2705`
+
+```python
+def loglike(self, params):
+    """
+    Logit 对数似然
+    
+    关键技巧：使用 q = 2y - 1 转换
+    - 当 y=1 时，q=1，计算 Λ(x'β)
+    - 当 y=0 时，q=-1，计算 Λ(-x'β) = 1 - Λ(x'β)
+    
+    利用对称性：Λ(-x) = 1 - Λ(x)
+    这样避免了直接计算 log(1-Λ(x)) 时的数值不稳定
+    """
+    q = 2 * self.endog - 1  # 转换为 +1/-1
+    linpred = self.predict(params, which="linear")
+    return np.sum(np.log(self.cdf(q * linpred)))
+```
+
+**Logit CDF 的数值稳定性**：
+
+```python
+def cdf(self, X):
+    """
+    Λ(x) = 1 / (1 + exp(-x))
+    
+    数值分析：
+    - 当 x → +∞: exp(-x) → 0，Λ(x) → 1
+    - 当 x → -∞: exp(-x) → ∞，Λ(x) → 0
+    
+    潜在问题：
+    - 当 x < -709 时，exp(-x) 会溢出为 inf
+    - 当 x > 709 时，exp(-x) 会下溢为 0
+    
+    但实际上：
+    - 当 x < -709，exp(-x) = inf，但 1/(1+inf) = 0 是正确的
+    - 当 x > 709，exp(-x) = 0，1/(1+0) = 1 是正确的
+    
+    所以 Logit 的 cdf() 本身是数值稳定的！
+    """
+    return 1 / (1 + np.exp(-X))
+```
+
+**Logit Score 和 Hessian 的数值稳定性**：
+
+```python
+def score(self, params):
+    """
+    梯度：∂ln L/∂β = Σ (y_i - Λ_i) x_i
+    
+    数值分析：
+    - Λ_i = 1/(1+exp(-Xβ))
+    - y_i - Λ_i 的范围是 (-1, 1)
+    - 不需要 clip，因为范围有限
+    """
+    y = self.endog
+    X = self.exog
+    fitted = self.predict(params)  # Λ(Xβ)
+    return np.dot(y - fitted, X)
+
+def hessian(self, params):
+    """
+    Hessian：∂²ln L/∂β∂β' = -Σ Λ_i(1-Λ_i) x_i x_i'
+    
+    数值分析：
+    - Λ(1-Λ) 的范围是 [0, 0.25]
+    - 当 Λ → 0 或 Λ → 1 时，Λ(1-Λ) → 0
+    - 不需要 clip，因为范围有限
+    """
+    X = self.exog
+    L = self.predict(params)
+    return -np.dot(L * (1 - L) * X.T, X)
+```
+
+### 7.3 Probit 模型的数值稳定处理
+
+**核心策略**：大量使用 `np.clip()` 防止 `log(0)` 和除零。
+
+**位置**：`discrete_model.py:2997-3146`
+
+**Probit 对数似然的数值稳定**：
+
+```python
+def loglike(self, params):
+    """
+    Probit 对数似然
+    
+    关键问题：
+    - 正态分布 Φ(x) 的尾部比 Logistic 分布薄得多
+    - 当 |x| > 8 时，Φ(x) 或 1-Φ(x) 会非常接近 0 或 1
+    - log(接近 0 的数) 会导致数值下溢或 inf
+    
+    解决方案：
+    - 使用 np.clip(cdf, FLOAT_EPS, 1)
+    - FLOAT_EPS ≈ 2.22e-16
+    """
+    q = 2 * self.endog - 1
+    linpred = self.predict(params, which="linear")
+    # 关键：clip 防止 log(0)
+    return np.sum(np.log(np.clip(self.cdf(q * linpred), FLOAT_EPS, 1)))
+```
+
+**Probit Score 的数值稳定**：
+
+```python
+def score(self, params):
+    """
+    Probit 梯度
+    
+    公式：∂ln L/∂β = Σ [q_i φ(q_i x_i'β) / Φ(q_i x_i'β)] x_i
+    
+    其中：
+    - λ_i = q_i φ(q_i Xβ) / Φ(q_i Xβ) 是逆米尔斯比率
+    
+    数值问题：
+    - 当 Φ(q_i Xβ) 接近 0 时，λ_i 会趋向无穷大
+    - 需要 clip Φ 值防止除零
+    
+    位置：discrete_model.py:3053
+    """
+    y = self.endog
+    X = self.exog
+    XB = self.predict(params, which="linear")
+    q = 2 * y - 1
+    
+    # 关键：clip 防止除零
+    # 同时限制在 [FLOAT_EPS, 1-FLOAT_EPS]
+    L = q * self.pdf(q * XB) / np.clip(self.cdf(q * XB), FLOAT_EPS, 1 - FLOAT_EPS)
+    return np.dot(L, X)
+```
+
+**Probit Hessian 的数值稳定**：
+
+```python
+def hessian(self, params):
+    """
+    Probit Hessian
+    
+    公式：∂²ln L/∂β∂β' = -Σ λ_i(λ_i + x_i'β) x_i x_i'
+    
+    数值问题：
+    - λ_i 可能很大（当 Φ 接近 0 时）
+    - 需要 clip 防止数值爆炸
+    
+    位置：discrete_model.py:3146
+    """
+    X = self.exog
+    XB = self.predict(params, which="linear")
+    q = 2 * self.endog - 1
+    
+    # 同样使用 clip
+    L = q * self.pdf(q * XB) / np.clip(self.cdf(q * XB), FLOAT_EPS, 1 - FLOAT_EPS)
+    return np.dot(-L * (L + XB) * X.T, X)
+```
+
+### 7.4 MNLogit 模型的数值稳定处理
+
+**当前实现的潜在问题**：Softmax 的指数上溢风险。
+
+**位置**：`discrete_model.py:3339`
+
+```python
+def cdf(self, X):
+    """
+    MNLogit 的 CDF (Softmax 函数)
+    
+    当前实现：
+    P(j|x) = exp(β_j'x) / Σ_k exp(β_k'x)
+    
+    代码：
+    eXB = np.column_stack((np.ones(len(X)), np.exp(X)))  # 添加基准类别
+    return eXB / eXB.sum(1)[:, None]
+    
+    数值问题：
+    - 当 X 的元素 > 709 时，np.exp(X) 会溢出为 inf
+    - 当任何 exp 值为 inf 时，整个 Softmax 计算会失败
+    
+    示例：
+    X = np.array([[800, 0, 0]])  # 第一个变量很大
+    np.exp(X)  # [inf, 1, 1]
+    sum = inf
+    Softmax = [inf/inf=nan, 1/inf=0, 1/inf=0]  # 结果错误
+    """
+    eXB = np.column_stack((np.ones(len(X)), np.exp(X)))
+    return eXB / eXB.sum(1)[:, None]
+```
+
+**标准的数值稳定 Softmax 实现**：
+
+```python
+def stable_softmax(X):
+    """
+    数值稳定的 Softmax 实现
+    
+    技巧：减去每行的最大值
+    X_stable = X - max(X)  （这样所有指数项都 <= 0）
+    
+    数学原理：
+    exp(X - max(X)) / Σ exp(X - max(X))
+    = [exp(X) / exp(max(X))] / [Σ exp(X) / exp(max(X))]
+    = exp(X) / Σ exp(X)
+    = 原始 Softmax
+    
+    这样计算时，指数项不会上溢（因为 X - max(X) <= 0）
+    """
+    # 对每行减去最大值
+    X_max = X.max(axis=1, keepdims=True)
+    X_stable = X - X_max
+    
+    # 计算指数（现在所有指数 <= 0，不会上溢）
+    exp_X = np.exp(X_stable)
+    
+    # 计算 Softmax
+    return exp_X / exp_X.sum(axis=1, keepdims=True)
+```
+
+**MNLogit 缺少的数值稳定处理**：
+
+| 数值问题 | 当前实现 | 标准稳定实现 |
+|----------|----------|--------------|
+| Softmax 指数上溢 | ❌ 无处理 | ✅ 减去最大值 |
+| log(0) 下溢 | 依赖 `cdf()` 的行为 | 通常使用 `log_softmax` |
+
+### 7.5 数值稳定处理对照总结
+
+| 维度 | Logit | Probit | MNLogit |
+|------|-------|--------|---------|
+| **核心策略** | 数学对称性 | 大量 clip | 无特殊处理 |
+| **常量** | 无 | `FLOAT_EPS` | 无 |
+| **loglike** | 利用 q=2y-1 变换 | `np.clip(cdf, FLOAT_EPS, 1)` | 无 clip |
+| **score** | 无 clip | `np.clip(cdf, FLOAT_EPS, 1-FLOAT_EPS)` | 无 clip |
+| **hessian** | 无 clip | `np.clip(cdf, FLOAT_EPS, 1-FLOAT_EPS)` | 无 clip |
+| **cdf 稳定性** | ✅ 天然稳定（exp 下溢不影响结果） | ⚠️ 依赖 clip | ❌ 有上溢风险 |
+
+### 7.6 数值稳定性的可核验示例
+
+**Probit vs Logit 在极端值下的行为**：
+
+```python
+import numpy as np
+from scipy import stats
+
+FLOAT_EPS = np.finfo(float).eps
+
+# 极端值测试
+x_extreme = 37  # 当 x=37 时，Φ(x) 已经非常接近 1
+
+# Logit 的行为
+logit_cdf = 1 / (1 + np.exp(-x_extreme))  # ≈ 1.0
+logit_log = np.log(logit_cdf)  # ≈ 0.0（稳定）
+print(f"Logit cdf({x_extreme}) = {logit_cdf}")
+print(f"Logit log(cdf({x_extreme})) = {logit_log}")
+
+# Probit 的行为（无 clip）
+probit_cdf = stats.norm.cdf(x_extreme)  # ≈ 1.0，但非常接近
+probit_cdf_clipped = np.clip(probit_cdf, FLOAT_EPS, 1)
+print(f"Probit cdf({x_extreme}) = {probit_cdf}")
+print(f"Probit cdf({x_extreme}) (raw) = {probit_cdf}")
+print(f"Probit log(cdf({x_extreme})) = {np.log(probit_cdf)}")  # 可能不稳定
+print(f"Probit log(clip(cdf)) = {np.log(probit_cdf_clipped)}")  # 稳定
+
+# MNLogit 的潜在问题
+X = np.array([[800, 0, 0]])  # 极端值
+eXB = np.column_stack((np.ones(len(X)), np.exp(X)))
+print(f"\nMNLogit exp(X) = {eXB}")  # [1, inf, 1, 1]
+softmax = eXB / eXB.sum(1)[:, None]
+print(f"MNLogit Softmax = {softmax}")  # [nan, 0, 0, 0] 或类似错误
+```
+
+---
+
+## 8. 优化方法对梯度Hessian的依赖与收敛行为（可核验深度）
+
+### 8.1 优化方法分类与依赖关系
+
+**位置**：`base/optimizer.py:237-262`
+
+```python
+methods = [
+    "newton",      # Newton-Raphson
+    "nm",          # Nelder-Mead
+    "bfgs",        # Broyden-Fletcher-Goldfarb-Shanno
+    "lbfgs",       # Limited-memory BFGS
+    "powell",      # Powell's method
+    "cg",          # Conjugate Gradient
+    "ncg",         # Newton-Conjugate Gradient
+    "basinhopping", # Global optimization
+    "minimize",    # Scipy minimize wrapper
+]
+
+fit_funcs = {
+    "newton": _fit_newton,
+    "nm": _fit_nm,
+    "bfgs": _fit_bfgs,
+    "lbfgs": _fit_lbfgs,
+    "cg": _fit_cg,
+    "ncg": _fit_ncg,
+    "powell": _fit_powell,
+    "basinhopping": _fit_basinhopping,
+    "minimize": _fit_minimize,
+}
+```
+
+### 8.2 各优化方法的依赖关系
+
+**位置**：`base/model.py:840-848`
+
+```
+Optimization methods that require only a likelihood function are 'nm' and 'powell'
+    只需要 loglike
+
+Optimization methods that require a likelihood function and a score/gradient
+are 'bfgs', 'cg', and 'ncg'. A function to compute the Hessian is optional for 'ncg'
+    需要 loglike + score，hessian 可选（仅 ncg）
+
+Optimization method that require a likelihood function, a score/gradient,
+and a Hessian is 'newton'
+    需要 loglike + score + hessian
+```
+
+### 8.3 优化方法依赖对照表
+
+| 方法 | 代码名 | 需要 loglike | 需要 score | 需要 hessian | 类型 |
+|------|--------|-------------|-----------|-------------|------|
+| **Newton-Raphson** | `newton` | ✅ | ✅ | ✅ | 二阶方法 |
+| **Newton-CG** | `ncg` | ✅ | ✅ | ⚠️ 可选 | 混合二阶 |
+| **BFGS** | `bfgs` | ✅ | ✅ | ❌ | 拟牛顿法 |
+| **L-BFGS** | `lbfgs` | ✅ | ✅ | ❌ | 有限内存拟牛顿 |
+| **Conjugate Gradient** | `cg` | ✅ | ✅ | ❌ | 非线性 CG |
+| **Nelder-Mead** | `nm` | ✅ | ❌ | ❌ | 无导数方法 |
+| **Powell** | `powell` | ✅ | ❌ | ❌ | 方向集方法 |
+| **Basinhopping** | `basinhopping` | ✅ | ✅ | 可选 | 全局优化 |
+| **Minimize 包装器** | `minimize` | 取决于子方法 | 取决于子方法 | 取决于子方法 | 通用包装器 |
+
+### 8.4 核心优化代码的依赖处理
+
+**位置**：`base/model.py:561-576`
+
+```python
+def fit(self, ..., method="newton", ...):
+    # 目标函数：负对数似然（最小化）
+    def f(params, *args):
+        return -self.loglike(params, *args) / nobs
+    
+    # 根据方法决定 score 和 hessian 的符号
+    # 注意：优化器通常最小化 f = -loglike
+    # 而 score() 返回的是 loglike 的梯度（最大化方向）
+    
+    if method == "newton":
+        # Newton 方法：score 和 hess 保持正号
+        # 因为 Newton 迭代：β_{k+1} = β_k - H^{-1} g
+        # 其中 g = ∇loglike（最大化方向）
+        def score(params, *args):
+            return self.score(params, *args) / nobs  # 正号
+        
+        def hess(params, *args):
+            return self.hessian(params, *args) / nobs  # 正号
+    else:
+        # 其他方法：score 和 hess 取负号
+        # 因为这些方法最小化 f = -loglike
+        # 梯度为 ∇f = -∇loglike
+        def score(params, *args):
+            return -self.score(params, *args) / nobs  # 负号！
+        
+        def hess(params, *args):
+            return -self.hessian(params, *args) / nobs  # 负号！
+```
+
+**符号处理的关键理解**：
+
+```
+问题：为什么 Newton 方法的符号不同？
+
+假设我们要最大化 loglike(β)：
+- Newton 方法（最大化）：β_{k+1} = β_k - H^{-1} g
+  其中 g = ∇loglike, H = ∇²loglike（负定）
+
+或者等价地，最小化 f(β) = -loglike(β)：
+- Newton 方法（最小化）：β_{k+1} = β_k - H_f^{-1} g_f
+  其中 g_f = ∇f = -g, H_f = ∇²f = -H
+
+在 statsmodels 中：
+- model.loglike() 返回 loglike（最大化目标）
+- model.score() 返回 ∇loglike（最大化梯度）
+- model.hessian() 返回 ∇²loglike（负定）
+
+优化器期望最小化 f = -loglike，所以：
+- 对于拟牛顿法 (bfgs, cg, ncg)：直接传递 ∇f = -score
+- 对于 Newton-Raphson：代码中保持正号，但迭代公式已考虑符号
+```
+
+### 8.5 Newton-Raphson 方法的实现
+
+**位置**：`base/optimizer.py:456`
+
+```python
+def _fit_newton(
+    f, score, start_params, fargs, kwargs, ..., hess=None, ridge_factor=1e-10
+):
+    """
+    Newton-Raphson 算法
+    
+    迭代公式：
+    β_{k+1} = β_k - H(β_k)^{-1} g(β_k)
+    
+    其中：
+    - g = ∇f = 梯度
+    - H = ∇²f = Hessian
+    
+    注意：
+    - 使用 ridge_factor 防止 Hessian 奇异
+    - H_ridge = H + ridge_factor * I
+    """
+    
+    # 初始化
+    x0 = start_params
+    iterations = 0
+    oldparams = 10 * x0 + 10  # 确保第一次迭代运行
+    
+    # Newton 迭代
+    while iterations < maxiter:
+        # 检查收敛
+        if np.allclose(x0, oldparams, rtol=tol):
+            converged = True
+            break
+        
+        oldparams = x0.copy()
+        
+        # 计算梯度和 Hessian
+        gradient = score(x0, *fargs)
+        H = hess(x0, *fargs)
+        
+        # 关键：Ridge 调整防止 Hessian 奇异
+        # H_ridge = H + λI, 其中 λ = 1e-10
+        H = H + ridge_factor * np.eye(len(H))
+        
+        # Newton 更新
+        try:
+            x0 = x0 - np.linalg.solve(H, gradient)
+        except np.linalg.LinAlgError:
+            # 如果 Hessian 仍然奇异，使用伪逆
+            x0 = x0 - np.dot(np.linalg.pinv(H), gradient)
+        
+        iterations += 1
+        if callback is not None:
+            callback(x0)
+    
+    return x0, retvals
+```
+
+**Newton-Raphson 的收敛特性**：
+
+| 特性 | 说明 |
+|------|------|
+| **收敛速度** | 二次收敛（接近解时） |
+| **每轮代价** | 高（需要计算和求逆 Hessian） |
+| **稳定性** | 依赖 Hessian 的正定性（或负定性） |
+| **初始化敏感** | 是，如果离解太远可能不收敛 |
+| **适用场景** | 当 Hessian 容易计算且相对良态时 |
+
+### 8.6 BFGS 方法的实现
+
+**位置**：`scipy.optimize.fmin_bfgs`（statsmodels 包装）
+
+```python
+def _fit_bfgs(f, score, start_params, fargs, kwargs, ...):
+    """
+    BFGS (Broyden-Fletcher-Goldfarb-Shanno) 拟牛顿法
+    
+    核心思想：
+    - 不直接计算 Hessian，而是从梯度变化中迭代估计
+    - 使用准牛顿更新公式：H_{k+1} ≈ H_k + 修正项
+    
+    相比 Newton 的优势：
+    - 不需要计算 Hessian
+    - 不需要求逆矩阵（更新逆 Hessian 近似）
+    - 每轮只需计算梯度
+    
+    相比 Newton 的劣势：
+    - 收敛速度是超线性，不是二次
+    - 需要更多迭代
+    - 可能在病态问题上收敛慢
+    """
+    # 调用 scipy.optimize.fmin_bfgs
+    from scipy.optimize import fmin_bfgs
+    
+    retvals = fmin_bfgs(
+        f,                      # 目标函数
+        start_params,           # 初始参数
+        fprime=score,           # 梯度函数
+        args=fargs,             # 额外参数
+        gtol=kwargs.get("gtol", 1e-05),  # 梯度收敛阈值
+        norm=kwargs.get("norm", np.inf),  # 范数类型
+        epsilon=kwargs.get("epsilon", 1.49e-08),  # 数值梯度步长
+        maxiter=maxiter,
+        full_output=full_output,
+        disp=disp,
+        retall=retall,
+        callback=callback,
+    )
+    return xopt, retvals
+```
+
+### 8.7 Nelder-Mead 无导数方法
+
+**位置**：`scipy.optimize.fmin`
+
+```python
+def _fit_nm(f, score, start_params, fargs, kwargs, ...):
+    """
+    Nelder-Mead 单纯形法（无导数）
+    
+    核心思想：
+    - 维护一个 n+1 个顶点的单纯形（n 是参数维度）
+    - 通过反射、扩张、收缩、收缩等操作移动单纯形
+    - 不需要梯度！
+    
+    优势：
+    - 不需要计算梯度或 Hessian
+    - 对非光滑函数更鲁棒
+    - 不需要良好的初始化
+    
+    劣势：
+    - 收敛速度慢（亚线性）
+    - 在高维空间效率低
+    - 可能收敛到局部最优
+    """
+    from scipy.optimize import fmin
+    
+    # 注意：score 参数被忽略！
+    retvals = fmin(
+        f,
+        start_params,
+        args=fargs,
+        xtol=kwargs.get("xtol", 1e-4),
+        ftol=kwargs.get("ftol", 1e-4),
+        maxiter=kwargs.get("maxfun", None),
+        maxfun=kwargs.get("maxfun", None),
+        full_output=full_output,
+        disp=disp,
+        retall=retall,
+        callback=callback,
+    )
+    return xopt, retvals
+```
+
+### 8.8 优化方法收敛行为对比
+
+| 方法 | 收敛类型 | 每轮迭代代价 | 初始化敏感度 | 高维适用性 | 稳定性 |
+|------|----------|-------------|-------------|-----------|--------|
+| **Newton** | 二次 | 高（Hessian 计算+求逆） | 高 | 低（O(K³)） | 低（依赖 Hessian 可逆） |
+| **BFGS** | 超线性 | 中（梯度计算） | 中 | 中（O(K²) 存储） | 中 |
+| **L-BFGS** | 超线性 | 中低（梯度计算） | 中 | 高（有限内存） | 中 |
+| **CG** | 线性/超线性 | 低（梯度计算） | 中高 | 高 | 中低 |
+| **NCG** | 超线性 | 中（梯度+Hessian 向量乘） | 中 | 中 | 中 |
+| **Nelder-Mead** | 亚线性 | 低（只需要函数值） | 低 | 低（单纯形扩展） | 高 |
+| **Powell** | 亚线性/线性 | 低（只需要函数值） | 低 | 中 | 高 |
+
+### 8.9 协方差矩阵计算的方法依赖
+
+**位置**：`base/model.py:613-632`
+
+```python
+def fit(...):
+    ...
+    # 协方差矩阵计算
+    if method == "newton" and full_output:
+        # Newton 方法：使用优化返回的 Hessian
+        # Hinv = (-Hessian)^{-1} / nobs
+        Hinv = np.linalg.inv(-retvals["Hessian"]) / nobs
+    elif not skip_hessian:
+        # 其他方法：需要重新计算 Hessian
+        H = -1 * self.hessian(xopt)
+        
+        # 检查 Hessian 是否正定
+        invertible = False
+        if np.all(np.isfinite(H)):
+            eigvals, eigvecs = np.linalg.eigh(H)
+            if np.min(eigvals) > 0:
+                invertible = True
+        
+        if invertible:
+            # 使用谱分解求逆
+            Hinv = eigvecs.dot(np.diag(1.0 / eigvals)).dot(eigvecs.T)
+            Hinv = np.asfortranarray((Hinv + Hinv.T) / 2.0)
+        else:
+            warnings.warn(
+                "Inverting hessian failed, no bse or cov_params available",
+                HessianInversionWarning,
+            )
+            Hinv = None
+    ...
+```
+
+**协方差矩阵计算的关键差异**：
+
+| 方法 | 协方差来源 | 是否需要重新计算 hessian |
+|------|-----------|--------------------------|
+| `newton` + `full_output` | 优化过程中的 Hessian | ❌ 不需要 |
+| 其他方法 + `skip_hessian=False` | 重新计算 `self.hessian(xopt)` | ✅ 需要 |
+| 任何方法 + `skip_hessian=True` | 不计算协方差 | ❌ 跳过 |
+
+### 8.10 默认方法选择
+
+**位置**：`base/model.py:365`
+
+```python
+def fit(self, ..., method="newton", ...):
+    """
+    默认使用 Newton-Raphson 方法
+    
+    原因：
+    1. 离散选择模型通常有解析的 Hessian
+    2. Newton 方法收敛快（二次收敛）
+    3. 当参数数量适中时（K 不太大），Hessian 计算可行
+    """
+```
+
+**当 Newton 方法失败时的备选策略**：
+
+```python
+# 用户可以切换到其他方法
+results = model.fit(method="bfgs")           # 拟牛顿法
+results = model.fit(method="nm")             # 无导数方法
+results = model.fit(method="lbfgs")          # 高维问题
+results = model.fit(method="powell")         # 无导数备选
+
+# 或者使用通用包装器
+results = model.fit(
+    method="minimize",
+    min_method="L-BFGS-B",  # 指定 scipy 方法
+    bounds=[(0, None)] * K   # 可以指定边界
+)
+```
+
+### 8.11 优化方法选择建议
+
+| 场景 | 推荐方法 | 原因 |
+|------|----------|------|
+| **标准情况** | `newton`（默认） | 收敛快，有解析 Hessian |
+| **高维问题 (K > 1000)** | `lbfgs` | 有限内存，不需要完整 Hessian |
+| **Hessian 计算困难** | `bfgs` | 拟牛顿，只需要梯度 |
+| **梯度计算也困难** | `nm` 或 `powell` | 无导数方法 |
+| **非光滑目标函数** | `nm` 或 `powell` | 对非光滑更鲁棒 |
+| **需要全局最优** | `basinhopping` | 全局优化方法 |
+| **需要边界约束** | `minimize` + `L-BFGS-B` | 支持边界 |
+
+---
+
+## 9. 边际效应输出形状对照（可核验深度）
+
+### 9.1 边际效应计算的入口
+
+**位置**：`discrete_margins.py:487`
+
+```python
+def get_margeff(self, at="overall", method="dydx", atexog=None, dummy=False, count=False):
+    """
+    核心边际效应计算
+    
+    参数：
+    at : {'overall', 'mean', 'median', 'zero', 'all'}
+        - 'overall': 所有观测的平均边际效应
+        - 'mean': 在解释变量均值处
+        - 'median': 在解释变量中位数处
+        - 'zero': 在解释变量为零处
+        - 'all': 每个观测的边际效应
+    """
+    results = self.results
+    model = results.model
+    params = results.params.copy()
+    
+    # 准备 exog 矩阵
+    if atexog is None:
+        if at == "mean":
+            exog = model.exog.mean(0)[None, :]  # (1, K)
+        elif at == "median":
+            exog = np.median(model.exog, 0)[None, :]  # (1, K)
+        elif at == "zero":
+            exog = np.zeros((1, model.exog.shape[1]))  # (1, K)
+        elif at == "all":
+            exog = model.exog  # (nobs, K)
+        elif at == "overall":
+            exog = model.exog  # (nobs, K) - 之后取平均
+    else:
+        exog = atexog  # 用户提供
+    
+    # 识别虚拟变量和计数变量
+    ...
+    
+    # 核心计算：调用模型的 _derivative_exog
+    margeff = model._derivative_exog(
+        params, exog, transform=method,
+        dummy_idx=dummy_ind, count_idx=count_ind
+    )
+    
+    # 根据 at 参数聚合
+    if at == "overall":
+        # 取所有观测的平均
+        margeff = np.mean(margeff, axis=0)
+    
+    # 计算标准误（Delta Method）
+    ...
+```
+
+### 9.2 二元模型边际效应输出形状
+
+**二元模型**：Logit, Probit
+
+**位置**：`discrete_model.py:670`
+
+```python
+def _derivative_exog(self, params, exog=None, transform="dydx", ...):
+    """
+    二元模型边际效应
+    
+    公式：∂P/∂x = f(Xβ) * β
+    其中 f(.) = pdf()
+    
+    返回形状：
+    - 当 exog 是 (nobs, K): 返回 (nobs, K)
+    - 当 exog 是 (1, K): 返回 (1, K)
+    """
+    linpred = self.predict(params, exog, offset=offset, which="linear")  # (nobs,)
+    
+    # 核心公式：f(Xβ) ⊗ β'
+    # self.pdf(linpred) 形状 (nobs,)
+    # params 形状 (K,)
+    # margeff 形状 (nobs, K)
+    margeff = np.dot(self.pdf(linpred)[:, None], params[None, :])
+    
+    # 变换处理
+    if "ex" in transform:
+        margeff *= exog  # (nobs, K) * (nobs, K) = (nobs, K)
+    if "ey" in transform:
+        margeff /= self.predict(params, exog)[:, None]  # (nobs, K) / (nobs, 1) = (nobs, K)
+    
+    return margeff  # (nobs, K)
+```
+
+### 9.3 多项模型边际效应输出形状
+
+**多项模型**：MNLogit
+
+**位置**：`discrete_model.py:979`
+
+```python
+def _derivative_exog(self, params, exog=None, transform="dydx", ...):
+    """
+    多项模型边际效应
+    
+    公式：∂P(j|x)/∂x_k = P(j|x) * [β_jk - Σ_l P(l|x) β_lk]
+    
+    返回形状：
+    - 当 exog 是 (nobs, K): 返回 (nobs, K*J) 扁平化
+      逻辑形状是 (nobs, K, J)
+    """
+    J = int(self.J)  # 类别数
+    K = int(self.K)  # 变量数
+    
+    # 重塑参数
+    params = params.reshape(K, -1, order="F")  # (K, J-1)
+    
+    # 添加基准类别参数（全0）
+    zeroparams = np.c_[np.zeros(K), params]  # (K, J)
+    
+    # 计算概率
+    cdf = self.cdf(np.dot(exog, params))  # (nobs, J)
+    
+    # 计算加权平均参数
+    iterm = np.array([cdf[:, [i]] * zeroparams[:, i] for i in range(int(J))]).sum(0)  # (K,)
+    
+    # 应用公式
+    # margeff 形状 (J, nobs, K)
+    margeff = np.array([cdf[:, [j]] * (zeroparams[:, j] - iterm) for j in range(J)])
+    
+    # 调整维度：(J, nobs, K) -> (nobs, K, J)
+    margeff = np.transpose(margeff, (1, 2, 0))  # (nobs, K, J)
+    
+    # 变换处理
+    if "ex" in transform:
+        margeff *= exog  # (nobs, K, J) * (nobs, K) = 广播后 (nobs, K, J)
+    if "ey" in transform:
+        margeff /= self.predict(params, exog)[:, None, :]  # (nobs, K, J) / (nobs, 1, J) = (nobs, K, J)
+    
+    # 扁平化：使用 Fortran 顺序
+    # (nobs, K, J) -> (nobs, K*J)
+    # 先遍历变量，再遍历类别
+    return margeff.reshape(len(exog), -1, order="F")  # (nobs, K*J)
+```
+
+### 9.4 边际效应形状对照总表
+
+| 模型类型 | `at` 参数 | `_derivative_exog` 返回 | 最终 `margeff` 形状 | `margeff.ndim` |
+|----------|-----------|-------------------------|---------------------|----------------|
+| **二元** | `'mean'` | `(1, K)` | `(K,)` | 1 |
+| **二元** | `'median'` | `(1, K)` | `(K,)` | 1 |
+| **二元** | `'zero'` | `(1, K)` | `(K,)` | 1 |
+| **二元** | `'overall'` | `(nobs, K)` | `(K,)`（平均后） | 1 |
+| **二元** | `'all'` | `(nobs, K)` | `(nobs, K)` | 2 |
+| **多项** | `'mean'` | `(1, K*J)` | `(K, J)` | 2 |
+| **多项** | `'median'` | `(1, K*J)` | `(K, J)` | 2 |
+| **多项** | `'zero'` | `(1, K*J)` | `(K, J)` | 2 |
+| **多项** | `'overall'` | `(nobs, K*J)` | `(K, J)`（平均后） | 2 |
+| **多项** | `'all'` | `(nobs, K*J)` | `(nobs, K, J)`（重塑后） | 3 |
+
+### 9.5 形状判断逻辑
+
+**位置**：`discrete_margins.py:502`
+
+```python
+def summary_frame(self, alpha=0.05):
+    """
+    返回边际效应的 DataFrame
+    
+    关键形状判断：
+    """
+    ...
+    if self.margeff.ndim == 2:
+        # MNLogit 情况 (at='overall', 'mean', 'median', 'zero')
+        # 形状 (K, J)
+        ci = self.conf_int(alpha)
+        table = np.column_stack(
+            [
+                i.ravel("F")  # Fortran 顺序扁平化
+                for i in [
+                    self.margeff,      # (K, J)
+                    self.margeff_se,   # (K, J)
+                    self.tvalues,      # (K, J)
+                    self.pvalues,      # (K, J)
+                    ci[:, 0, :],       # (K, J)
+                    ci[:, 1, :],       # (K, J)
+                ]
+            ]
+        )
+        # 使用 MultiIndex
+        index = MultiIndex.from_tuples(
+            list(zip(ynames, xnames)), names=["endog", "exog"]
+        )
+    else:
+        # 二元模型情况 (at='overall', 'mean', 'median', 'zero')
+        # 形状 (K,)
+        table = np.column_stack(
+            (
+                self.margeff,      # (K,)
+                self.margeff_se,   # (K,)
+                self.tvalues,      # (K,)
+                self.pvalues,      # (K,)
+                self.conf_int(alpha),  # (K, 2)
+            )
+        )
+        index = var_names  # 简单索引
+```
+
+### 9.6 边际效应标准误形状
+
+**位置**：`discrete_margins.py:271`
+
+```python
+def margeff_cov_params(...):
+    """
+    Delta Method 计算边际效应协方差
+    
+    返回形状：
+    - 二元模型 (at='overall'): (K, K)
+    - 多项模型 (at='overall'): (K*J, K*J)
+    """
+    ...
+    # Jacobian 形状
+    # - 二元模型: (K, n_params)
+    # - 多项模型: (K*J, n_params) 其中 n_params = K*(J-1)
+    
+    # 应用 Delta Method
+    # Asy.Var[ME] = J * cov_params * J^T
+    return np.dot(np.dot(jacobian_mat, cov_params), jacobian_mat.T)
+```
+
+**标准误形状对照**：
+
+| 模型 | `at` | `margeff_se` 形状 | `cov_margins` 形状 |
+|------|------|-------------------|-------------------|
+| 二元 | `'overall'` | `(K,)` | `(K, K)` |
+| 二元 | `'all'` | `(nobs, K)` | `(nobs, K, K)` 或其他 |
+| 多项 | `'overall'` | `(K, J)` | `(K*J, K*J)` |
+| 多项 | `'all'` | 更复杂 | 更复杂 |
+
+### 9.7 置信区间形状
+
+**位置**：`discrete_margins.py:544`
+
+```python
+def conf_int(self, alpha=0.05):
+    """
+    置信区间
+    
+    公式：me ± z_{1-α/2} * se
+    """
+    me_se = self.margeff_se
+    q = norm.ppf(1 - alpha / 2)
+    lower = self.margeff - q * me_se
+    upper = self.margeff + q * me_se
+    return np.asarray(lzip(lower, upper))
+```
+
+**置信区间形状对照**：
+
+| 模型 | `at` | `conf_int()` 返回 | 实际形状 |
+|------|------|-------------------|----------|
+| 二元 | `'overall'` | `lzip(lower, upper)` | `(K, 2)` |
+| 二元 | `'all'` | `lzip(lower, upper)` | `(nobs, K, 2)` |
+| 多项 | `'overall'` | `lzip(lower, upper)` | `(K, 2, J)` 或类似 |
+| 多项 | `'all'` | 更复杂 | 更复杂 |
+
+### 9.8 可核验的形状示例
+
+**示例代码**：
+
+```python
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+
+# 二元模型示例
+data_bin = sm.datasets.spector.load()
+X_bin = sm.add_constant(data_bin.exog)
+y_bin = data_bin.endog
+
+logit_mod = sm.Logit(y_bin, X_bin)
+logit_res = logit_mod.fit()
+
+# 多项模型示例
+data_multi = sm.datasets.fair.load()
+X_multi = sm.add_constant(data_multi.exog[['age', 'educ', 'occupation', 'rate', 'religious']])
+y_multi = data_multi.endog  # 婚姻质量评分（6个类别）
+
+mnlogit_mod = sm.MNLogit(y_multi, X_multi)
+mnlogit_res = mnlogit_mod.fit()
+
+# 检查形状
+print("=" * 60)
+print("二元模型 (Logit)")
+print("=" * 60)
+
+for at_param in ['overall', 'mean', 'median', 'zero', 'all']:
+    try:
+        me = logit_res.get_margeff(at=at_param)
+        print(f"\nat='{at_param}':")
+        print(f"  margeff.shape: {me.margeff.shape}")
+        print(f"  margeff.ndim: {me.margeff.ndim}")
+        print(f"  margeff_se.shape: {me.margeff_se.shape}")
+    except Exception as e:
+        print(f"\nat='{at_param}': 错误 - {e}")
+
+print("\n" + "=" * 60)
+print("多项模型 (MNLogit)")
+print("=" * 60)
+
+for at_param in ['overall', 'mean', 'median', 'zero', 'all']:
+    try:
+        me = mnlogit_res.get_margeff(at=at_param)
+        print(f"\nat='{at_param}':")
+        print(f"  margeff.shape: {me.margeff.shape}")
+        print(f"  margeff.ndim: {me.margeff.ndim}")
+        print(f"  margeff_se.shape: {me.margeff_se.shape}")
+    except Exception as e:
+        print(f"\nat='{at_param}': 错误 - {e}")
+```
+
+**预期输出**：
+
+```
+============================================================
+二元模型 (Logit)
+============================================================
+
+at='overall':
+  margeff.shape: (4,)
+  margeff.ndim: 1
+  margeff_se.shape: (4,)
+
+at='mean':
+  margeff.shape: (4,)
+  margeff.ndim: 1
+  margeff_se.shape: (4,)
+
+at='median':
+  margeff.shape: (4,)
+  margeff.ndim: 1
+  margeff_se.shape: (4,)
+
+at='zero':
+  margeff.shape: (4,)
+  margeff.ndim: 1
+  margeff_se.shape: (4,)
+
+at='all':
+  margeff.shape: (32, 4)
+  margeff.ndim: 2
+  margeff_se.shape: (32, 4)
+
+============================================================
+多项模型 (MNLogit)
+============================================================
+
+at='overall':
+  margeff.shape: (6, 6)  # (K, J)
+  margeff.ndim: 2
+  margeff_se.shape: (6, 6)
+
+at='mean':
+  margeff.shape: (6, 6)
+  margeff.ndim: 2
+  margeff_se.shape: (6, 6)
+
+at='median':
+  margeff.shape: (6, 6)
+  margeff.ndim: 2
+  margeff_se.shape: (6, 6)
+
+at='zero':
+  margeff.shape: (6, 6)
+  margeff.ndim: 2
+  margeff_se.shape: (6, 6)
+
+at='all':
+  margeff.shape: (6366, 6, 6)  # (nobs, K, J)
+  margeff.ndim: 3
+  margeff_se.shape: (6366, 6, 6)
+```
+
+### 9.9 边际效应形状处理的最佳实践
+
+**用户代码建议**：
+
+```python
+def analyze_margeff(me_results, model):
+    """
+    通用边际效应分析函数
+    """
+    J = getattr(model, 'J', 1)
+    
+    if me_results.margeff.ndim == 1:
+        # 二元模型 (at='overall', 'mean', 'median', 'zero')
+        print("二元模型 - 聚合边际效应")
+        for name, val, se in zip(model.exog_names, me_results.margeff, me_results.margeff_se):
+            print(f"  {name}: {val:.4f} (se={se:.4f})")
+    
+    elif me_results.margeff.ndim == 2:
+        if J == 1:
+            # 二元模型 (at='all')
+            print("二元模型 - 逐观测边际效应")
+            print(f"  观测数: {me_results.margeff.shape[0]}")
+            print(f"  变量数: {me_results.margeff.shape[1]}")
+        else:
+            # 多项模型 (at='overall', 'mean', 'median', 'zero')
+            print(f"多项模型 - 聚合边际效应 (J={J})")
+            K, J = me_results.margeff.shape
+            for j in range(J):
+                print(f"\n  类别 {j}:")
+                for k, name in enumerate(model.exog_names):
+                    print(f"    {name}: {me_results.margeff[k, j]:.4f} (se={me_results.margeff_se[k, j]:.4f})")
+    
+    elif me_results.margeff.ndim == 3:
+        # 多项模型 (at='all')
+        nobs, K, J = me_results.margeff.shape
+        print(f"多项模型 - 逐观测边际效应 (nobs={nobs}, K={K}, J={J})")
+        print(f"  形状: (nobs={nobs}, K={K}, J={J})")
+```
+
+---
+
+## 附录：关键类和方法索引
+
+### 模型类索引
+
+| 类名 | 文件位置 | 继承链 | 核心职责 |
+|------|----------|--------|----------|
+| `LikelihoodModel` | `base/model.py:279` | `Model` | 定义 loglike/score/hessian 接口，实现 fit() |
+| `DiscreteModel` | `discrete_model.py:185` | `LikelihoodModel` | 定义 cdf/pdf/predict/_derivative_exog 接口 |
+| `BinaryModel` | `discrete_model.py:521` | `DiscreteModel` | 实现 predict() 和 _derivative_exog() 通用框架 |
+| `MultinomialModel` | `discrete_model.py:758` | `BinaryModel` | 重写 initialize()/predict()/_derivative_exog() |
+| `Logit` | `discrete_model.py:2622` | `BinaryModel` | 实现 cdf()/pdf()/loglike()/score()/hessian() |
+| `Probit` | `discrete_model.py:2929` | `BinaryModel` | 实现 cdf()/pdf()/loglike()/score()/hessian() |
+| `MNLogit` | `discrete_model.py:3255` | `MultinomialModel` | 实现 cdf()/loglike()/score()/hessian() |
+
+### 结果类索引
+
+| 类名 | 文件位置 | 继承链 | 核心职责 |
+|------|----------|--------|----------|
+| `LikelihoodModelResults` | `base/model.py:1276` | `Results` | MLE 结果基类 |
+| `DiscreteResults` | `discrete_model.py:4952` | `LikelihoodModelResults` | 离散结果基类，实现 summary()/get_margeff() |
+| `BinaryResults` | `discrete_model.py:5753` | `DiscreteResults` | 二元结果，扩展 summary() 添加分离检测 |
+| `MultinomialResults` | `discrete_model.py:5969` | `DiscreteResults` | 多项结果，特化 bse/tvalues/pvalues/conf_int() |
+
+### 边际效应类索引
+
+| 类名/函数 | 文件位置 | 核心职责 |
+|-----------|----------|----------|
+| `DiscreteMargins` | `discrete_margins.py:433` | 边际效应计算和格式化 |
+| `DiscreteMargins.get_margeff()` | `discrete_margins.py:487` | 核心计算逻辑 |
+| `DiscreteMargins.summary()` | `discrete_margins.py:567` | 边际效应摘要格式化 |
+| `margeff_cov_params()` | `discrete_margins.py:271` | Delta Method 计算标准误 |
+| `_get_dummy_effects()` | `discrete_margins.py:177` | 虚拟变量边际效应计算 |
+
+### 关键方法位置
+
+| 方法 | 类名 | 文件位置:行号 | 说明 |
+|------|------|---------------|------|
+| `loglike` | `LikelihoodModel` | `base/model.py:300` | 抽象方法定义 |
+| `loglike` | `Logit` | `discrete_model.py:2705` | Logit 对数似然 |
+| `loglike` | `Probit` | `discrete_model.py:2997` | Probit 对数似然 |
+| `loglike` | `MNLogit` | `discrete_model.py:3342` | 多项 Logit 对数似然 |
+| `score` | `Logit` | `discrete_model.py:2765` | Logit 梯度 |
+| `score` | `Probit` | `discrete_model.py:3053` | Probit 梯度 |
+| `score` | `MNLogit` | `discrete_model.py:3408` | 多项 Logit 梯度 |
+| `hessian` | `Logit` | `discrete_model.py:2846` | Logit Hessian |
+| `hessian` | `Probit` | `discrete_model.py:3146` | Probit Hessian |
+| `hessian` | `MNLogit` | `discrete_model.py:3484` | 多项 Logit Hessian |
+| `cdf` | `Logit` | `discrete_model.py:2630` | Logistic CDF |
+| `cdf` | `Probit` | `discrete_model.py:2937` | 正态 CDF |
+| `cdf` | `MNLogit` | `discrete_model.py:3263` | Softmax |
+| `pdf` | `Logit` | `discrete_model.py:2637` | Logistic PDF |
+| `pdf` | `Probit` | `discrete_model.py:2944` | 正态 PDF |
+| `predict` | `BinaryModel` | `discrete_model.py:538` | 二元预测框架 |
+| `predict` | `MultinomialModel` | `discrete_model.py:802` | 多项预测框架 |
+| `_derivative_exog` | `BinaryModel` | `discrete_model.py:670` | 二元边际效应框架 |
+| `_derivative_exog` | `MultinomialModel` | `discrete_model.py:979` | 多项边际效应框架 |
+| `fit` | `LikelihoodModel` | `base/model.py:362` | MLE 拟合 |
+| `fit` | `DiscreteModel` | `discrete_model.py:242` | 添加分离检测 |
+| `summary` | `DiscreteResults` | `discrete_model.py:5390` | 通用摘要 |
+| `summary` | `BinaryResults` | `discrete_model.py:5780` | 二元摘要（分离检测） |
+| `get_margeff` | `DiscreteResults` | `discrete_model.py:5293` | 边际效应入口 |
+
+---
+
+**分析日期**：2026-05-03
+
+**分析版本**：修正版 v1.0
+
+**主要修正内容**：
+1. 校准了 `loglike/score/hessian` 的定义层次（在 `LikelihoodModel`，而非 `DiscreteModel`）
+2. 明确了 `pdf()` 方法的不一致性（`MNLogit` 不实现）
+3. 补充了完整的边际效应接口和摘要挂接关系
+4. 重新评估了继承体系的好处与限制
+5. 给出了修正后的设计缺陷总结和改进建议
