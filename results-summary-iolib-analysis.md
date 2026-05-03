@@ -793,6 +793,10 @@ Results (base/model.py:1112)
     │   ├── bic: float (@cache_readonly)
     │   └── llnull: float (@cache_readonly, 部分子类)
     │
+    ├── GenericLikelihoodModelResults (base/model.py:2802)
+    │   └── 继承: LikelihoodModelResults + ResultMixin
+    │   └── 用途: GenericLikelihoodModel 的默认结果类
+    │
     ├── RegressionResults (regression/linear_model.py)
     │   ├── rsquared / rsquared_adj
     │   ├── fvalue / f_pvalue
@@ -803,11 +807,21 @@ Results (base/model.py:1112)
     │   ├── pearson_chi2
     │   └── family / link
     │
-    ├── GenericLikelihoodModelResults (base/model.py:2802)
-    │   └── (离散模型的基类)
+    ├── DiscreteResults (discrete/discrete_model.py:4905)  ← 离散模型独立分支
+    │   ├── 继承: base.LikelihoodModelResults (直接继承，不经过 GenericLikelihoodModelResults)
+    │   ├── 子分支:
+    │   │   ├── CountResults → PoissonResults, NegativeBinomialResults, 等
+    │   │   ├── BinaryResults → LogitResults, ProbitResults
+    │   │   ├── OrderedResults
+    │   │   └── MultinomialResults → MNLogitResults
+    │   └── 特有属性/方法:
+    │       ├── prsquared (伪R²，@cache_readonly)
+    │       ├── llnull (空模型对数似然，@cache_readonly)
+    │       ├── llr, llr_pvalue (似然比检验，@cache_readonly)
+    │       └── set_null_options() (缓存管理)
     │
     └── MLEResults (tsa/statespace/mlemodel.py:2560)
-        ├── hqic (Hannan-Quinn 准则)
+        ├── hqic (Hannan-Quinn 准则，时间序列特有)
         ├── filter_results
         └── param_names
 ```
